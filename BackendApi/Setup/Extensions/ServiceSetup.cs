@@ -18,6 +18,7 @@ using BackendApi.Services.Orders;
 using BackendApi.Services.Ai;
 using BackendApi.Services.Tracking;
 using BackendApi.Services.Analytics;
+using BackendApi.Services.Storage;
 using BackendApi.Services.Telemetry;
 using BackendApi.Infrastructure.EventBus;
 using BackendApi.Infrastructure.EventBus.Handlers;
@@ -367,3 +368,4 @@ public static class ServiceSetup
         return false;
     }
 }
+
