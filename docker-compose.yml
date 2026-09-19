@@ -1,8 +1,9 @@
+name: delivery_v2
 services:
   # 1. ระบบจัดการฐานข้อมูลเชิงพื้นที่ [cite: 67, 71]
   db:
     image: postgis/postgis:15-3.3
-    container_name: delivery-db
+    container_name: delivery-v2-db
     command:
       - "postgres"
       - "-c"
@@ -36,7 +37,7 @@ services:
   # 1.5 PgBouncer (Connection Pooling)
   pgbouncer:
     image: edoburu/pgbouncer:latest
-    container_name: delivery-pgbouncer
+    container_name: delivery-v2-pgbouncer
     environment:
       - DB_USER=postgres
       - DB_PASSWORD=${POSTGRES_PASSWORD}
@@ -56,7 +57,7 @@ services:
     build:
       context: ./BackendApi
       dockerfile: Dockerfile
-    container_name: delivery-backend
+    container_name: delivery-v2-backend
     restart: unless-stopped
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
@@ -83,7 +84,7 @@ services:
       - Routing__OsrmTimeoutMs=5000
       - Authentication__RequireSecureCookie=true
       - SeedAdminPassword=${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD must be set}
-      - MessageBroker__Host=delivery-rabbitmq
+      - MessageBroker__Host=delivery-v2-rabbitmq
       - MessageBroker__Port=5672
       - MessageBroker__Username=${RABBITMQ_USER}
       - MessageBroker__Password=${RABBITMQ_PASSWORD}
@@ -112,7 +113,7 @@ services:
   # 3. Redis — Realtime Speed Layer (GPS Cache, Distributed Lock, Rider Presence)
   redis:
     image: redis:7-alpine
-    container_name: delivery-redis
+    container_name: delivery-v2-redis
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD}
     environment:
       - REDISCLI_AUTH=${REDIS_PASSWORD}
@@ -130,7 +131,7 @@ services:
     build:
       context: ./route-optimizer
       dockerfile: Dockerfile
-    container_name: delivery-route-optimizer
+    container_name: delivery-v2-route-optimizer
     environment:
       - DATABASE_URL=postgresql://postgres@db:5432/delivery_db
       - ROUTE_OPTIMIZER_OSRM_URL=http://osrm:5000
@@ -162,7 +163,7 @@ services:
     build:
       context: ./admin-dashboard
       dockerfile: Dockerfile
-    container_name: delivery-frontend
+    container_name: delivery-v2-frontend
     depends_on:
       backend:
         condition: service_healthy
@@ -173,7 +174,7 @@ services:
     build:
       context: ./delivery_app
       dockerfile: Dockerfile
-    container_name: delivery-delivery-app
+    container_name: delivery-v2-delivery-app
     volumes:
       - ./delivery_app/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - map_tile_cache:/var/cache/nginx/map_tiles
@@ -183,7 +184,7 @@ services:
   # 7. ระบบคำนวณเส้นทางถนน Dijkstra (Offline OSRM Server)
   osrm:
     image: osrm/osrm-backend
-    container_name: delivery-osrm
+    container_name: delivery-v2-osrm
     user: root
     volumes:
       - ./osrm_data:/data
@@ -193,7 +194,7 @@ services:
   # 8. Nginx Reverse Proxy
   nginx-proxy:
     image: nginx:alpine
-    container_name: delivery-nginx
+    container_name: delivery-v2-nginx
     ports:
       - "${NGINX_PORT:-80}:80"
     volumes:
@@ -207,7 +208,7 @@ services:
   # 9. Seq (Centralized Logging)
   seq:
     image: datalust/seq:latest
-    container_name: delivery-seq
+    container_name: delivery-v2-seq
     environment:
       - ACCEPT_EULA=Y
       - SEQ_FIRSTRUN_ADMINPASSWORDHASH=${SEQ_ADMIN_PASSWORD_HASH:?SEQ_ADMIN_PASSWORD_HASH must be set}
@@ -223,7 +224,7 @@ services:
   # 10. Prometheus (Metrics)
   prometheus:
     image: prom/prometheus:latest
-    container_name: delivery-prometheus
+    container_name: delivery-v2-prometheus
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       - ./prometheus/rules:/etc/prometheus/rules
@@ -234,7 +235,7 @@ services:
   # 11. Grafana (Dashboard)
   grafana:
     image: grafana/grafana-enterprise
-    container_name: delivery-grafana
+    container_name: delivery-v2-grafana
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
@@ -245,7 +246,7 @@ services:
   # 13. Alertmanager (Security & Operational Alerts)
   alertmanager:
     image: prom/alertmanager:latest
-    container_name: delivery-alertmanager
+    container_name: delivery-v2-alertmanager
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
     restart: unless-stopped
@@ -253,7 +254,7 @@ services:
   # 12. RabbitMQ Message Broker (Real-time Event Architecture)
   rabbitmq:
     image: rabbitmq:3-management-alpine
-    container_name: delivery-rabbitmq
+    container_name: delivery-v2-rabbitmq
     environment:
       - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD}
@@ -269,7 +270,7 @@ services:
   # 14. HashiCorp Vault (Secrets Management - Local Dev Mode)
   vault:
     image: hashicorp/vault:latest
-    container_name: delivery-vault
+    container_name: delivery-v2-vault
     environment:
       - VAULT_DEV_ROOT_TOKEN_ID=${VAULT_DEV_ROOT_TOKEN:?VAULT_DEV_ROOT_TOKEN must be set}
       - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
@@ -286,7 +287,7 @@ services:
 
   vault-bootstrap:
     image: hashicorp/vault:latest
-    container_name: delivery-vault-bootstrap
+    container_name: delivery-v2-vault-bootstrap
     user: "root"
     depends_on:
       vault:
@@ -318,7 +319,7 @@ services:
   # 15. cAdvisor (Container Advisor)
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
-    container_name: delivery-cadvisor
+    container_name: delivery-v2-cadvisor
     privileged: true
     devices:
       - /dev/kmsg
@@ -333,7 +334,7 @@ services:
   # 16. Node Exporter (Host Metrics)
   node-exporter:
     image: prom/node-exporter:latest
-    container_name: delivery-node-exporter
+    container_name: delivery-v2-node-exporter
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
@@ -347,7 +348,7 @@ services:
   # 17. PostgreSQL Exporter
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:latest
-    container_name: delivery-postgres-exporter
+    container_name: delivery-v2-postgres-exporter
     environment:
       - DATA_SOURCE_NAME=postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/delivery_db?sslmode=disable
     restart: unless-stopped
@@ -358,7 +359,7 @@ services:
   # 18. Redis Exporter
   redis-exporter:
     image: oliver006/redis_exporter:latest
-    container_name: delivery-redis-exporter
+    container_name: delivery-v2-redis-exporter
     environment:
       - REDIS_ADDR=redis://redis:6379
       - REDIS_PASSWORD=${REDIS_PASSWORD}
@@ -369,11 +370,11 @@ services:
 
   minio:
     image: quay.io/minio/minio:latest
-    container_name: delivery-minio
+    container_name: delivery-v2-minio
     restart: unless-stopped
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9002:9000"
+      - "9003:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -394,4 +395,8 @@ volumes:
   data_protection_keys:
   map_tile_cache:
   minio_data:
+
+
+
+
 
