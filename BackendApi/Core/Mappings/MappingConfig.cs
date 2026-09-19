@@ -1,0 +1,112 @@
+﻿using BackendApi.Models;
+using BackendApi.Models.Entities;
+using BackendApi.Models.SystemModels;
+using BackendApi.Models.DTOs;
+using Mapster;
+using NetTopologySuite.Geometries;
+
+namespace BackendApi.Core.Mappings;
+
+/// <summary>
+/// จุดศูนย์รวมตั้งค่าการแปลง Entity ↔ DTO ด้วย Mapster
+/// ทุกคนในทีมต้องมาลงทะเบียน Mapping ที่นี่
+/// </summary>
+public static class MappingConfig
+{
+    public static TypeAdapterConfig Configure()
+    {
+        var config = TypeAdapterConfig.GlobalSettings;
+        config.Default.IgnoreNullValues(true);
+
+        // ================================================
+        // Order Entity ↔ OrderDto
+        // ================================================
+        config.NewConfig<Order, OrderDto>()
+            .Map(dest => dest.PickupLat, src => src.PickupLocation != null ? src.PickupLocation.Y : (double?)null)
+            .Map(dest => dest.PickupLng, src => src.PickupLocation != null ? src.PickupLocation.X : (double?)null)
+            .Map(dest => dest.DropoffLat, src => src.DropoffLocation != null ? src.DropoffLocation.Y : (double?)null)
+            .Map(dest => dest.DropoffLng, src => src.DropoffLocation != null ? src.DropoffLocation.X : (double?)null);
+
+        config.NewConfig<CreateOrderDto, Order>()
+            .Map(dest => dest.PickupLocation, src => CreatePoint(src.PickupLng, src.PickupLat))
+            .Map(dest => dest.DropoffLocation, src => CreatePoint(src.DropoffLng, src.DropoffLat))
+            .Map(dest => dest.Id, _ => Guid.NewGuid().ToString());
+
+        // ================================================
+        // OrderItem Entity ↔ OrderItemDto
+        // ================================================
+        config.NewConfig<OrderItem, OrderItemDto>();
+        config.NewConfig<CreateOrderItemDto, OrderItem>()
+            .Map(dest => dest.Id, _ => Guid.NewGuid().ToString());
+
+        // ================================================
+        // Rider Entity ↔ RiderDto
+        // ================================================
+        config.NewConfig<Rider, RiderDto>()
+            .Map(dest => dest.Status, src => src.State.ToString())
+            .Map(dest => dest.Lat, src => src.CurrentLocation != null ? src.CurrentLocation.Y : (double?)null)
+            .Map(dest => dest.Lng, src => src.CurrentLocation != null ? src.CurrentLocation.X : (double?)null)
+            .Map(dest => dest.LastUpdated, src => src.LastGpsUpdate ?? src.UpdatedAt);
+
+        config.NewConfig<CreateRiderDto, Rider>()
+            .Map(dest => dest.CurrentLocation, src => src.Lat.HasValue && src.Lng.HasValue
+                ? CreatePoint(src.Lng.Value, src.Lat.Value)
+                : null)
+            .Map(dest => dest.Id, _ => Guid.NewGuid().ToString());
+
+        // ================================================
+        // Shop Entity ↔ ShopDto
+        // ================================================
+        config.NewConfig<Shop, ShopDto>()
+            .Map(dest => dest.Lat, src => src.Location != null ? src.Location.Y : (double?)null)
+            .Map(dest => dest.Lng, src => src.Location != null ? src.Location.X : (double?)null);
+
+        config.NewConfig<ShopDto, Shop>()
+            .Map(dest => dest.Location, src => src.Lat.HasValue && src.Lng.HasValue
+                ? CreatePoint(src.Lng.Value, src.Lat.Value)
+                : null);
+
+        config.NewConfig<CreateShopDto, Shop>()
+            .Map(dest => dest.Location, src => CreatePoint(src.Lng, src.Lat))
+            .Map(dest => dest.Id, _ => Guid.NewGuid().ToString());
+
+        // ================================================
+        // MenuCategory Entity ↔ MenuCategoryDto
+        // ================================================
+        config.NewConfig<MenuCategory, MenuCategoryDto>();
+        config.NewConfig<CreateMenuCategoryDto, MenuCategory>()
+            .Map(dest => dest.Id, _ => Guid.NewGuid().ToString());
+
+        // ================================================
+        // CustomerAddress Entity ↔ CustomerAddressDto
+        // ================================================
+        config.NewConfig<CustomerAddress, CustomerAddressDto>()
+            .Map(dest => dest.Latitude, src => src.Location != null ? src.Location.Y : 0)
+            .Map(dest => dest.Longitude, src => src.Location != null ? src.Location.X : 0);
+
+        config.NewConfig<CreateCustomerAddressDto, CustomerAddress>()
+            .Map(dest => dest.Location, src => CreatePoint(src.Longitude, src.Latitude))
+            .Map(dest => dest.Id, _ => Guid.NewGuid().ToString());
+
+        return config;
+    }
+
+    /// <summary>
+    /// สร้าง PostGIS Point จาก lng/lat (SRID 4326)
+    /// Force 2D โดยใช้ GeometryFactory เพื่อป้องกัน Z dimension
+    /// ที่ทำให้เกิด "Geometry has Z dimension but column does not" ใน PostGIS
+    /// </summary>
+    public static Point CreatePoint(double lng, double lat)
+    {
+        var sequenceFactory = new NetTopologySuite.Geometries.Implementation.PackedCoordinateSequenceFactory(
+            NetTopologySuite.Geometries.Implementation.PackedCoordinateSequenceFactory.PackedType.Double);
+        var factory = new GeometryFactory(new PrecisionModel(), srid: 4326, sequenceFactory);
+        var sequence = sequenceFactory.Create(1, Ordinates.XY);
+        sequence.SetX(0, lng);
+        sequence.SetY(0, lat);
+
+        return factory.CreatePoint(sequence);
+    }
+}
+
+

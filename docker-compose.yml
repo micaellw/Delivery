@@ -1,0 +1,376 @@
+services:
+  # 1. ระบบจัดการฐานข้อมูลเชิงพื้นที่ [cite: 67, 71]
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: delivery-db
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=1000"
+      - "-c"
+      - "shared_buffers=1GB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "effective_cache_size=2GB"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=delivery_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d delivery_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 1.5 PgBouncer (Connection Pooling)
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: delivery-pgbouncer
+    environment:
+      - DB_USER=postgres
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_HOST=db
+      - DB_NAME=delivery_db
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=10000
+      - DEFAULT_POOL_SIZE=100
+      - AUTH_TYPE=scram-sha-256
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 2. ระบบประมวลผลหลัก (.NET 8) [cite: 27, 68]
+  backend:
+    build:
+      context: ./BackendApi
+      dockerfile: Dockerfile
+    container_name: delivery-backend
+    restart: unless-stopped
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=pgbouncer;Database=delivery_db;Username=postgres;Password=${POSTGRES_PASSWORD};Maximum Pool Size=100;Timeout=5;CommandTimeout=5;
+      - ConnectionStrings__Redis=redis:6379,password=${REDIS_PASSWORD}
+      - ROUTE_OPTIMIZER_URL=http://route-optimizer:8000
+      - AI_SERVICE_URL=http://route-optimizer:8000
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_ROLE_ID_FILE=/vault/approle/backend_role_id
+      - VAULT_SECRET_ID_FILE=/vault/approle/backend_secret_id
+      - VAULT_REQUIRED=true
+      - Jwt__Issuer=DeliveryBackendApi
+      - Jwt__Audience=DeliveryClients
+      - Cors__AllowedOrigins__0=http://localhost
+      - Cors__AllowedOrigins__1=http://localhost:80
+      - Cors__AllowedOrigins__2=http://localhost:4200
+      - Cors__AllowedOrigins__3=http://localhost:8080
+      - Cors__AllowedOrigins__4=http://localhost:8081
+      - Cors__AllowedOrigins__5=http://localhost:4201
+      - Cors__AllowedOrigins__6=http://127.0.0.1:4201
+      - Cors__AllowedOrigins__7=http://localhost:8083
+      - Cors__AllowedOrigins__8=http://127.0.0.1:8083
+      - Routing__LocalOsrmUrl=http://osrm:5000
+      - Routing__OsrmTimeoutMs=5000
+      - Authentication__RequireSecureCookie=true
+      - SeedAdminPassword=${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD must be set}
+      - MessageBroker__Host=delivery-rabbitmq
+      - MessageBroker__Port=5672
+      - MessageBroker__Username=${RABBITMQ_USER}
+      - MessageBroker__Password=${RABBITMQ_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      vault-bootstrap:
+        condition: service_healthy
+      route-optimizer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:80/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    volumes:
+      - vault_approle_data:/vault/approle:ro
+      - data_protection_keys:/root/.aspnet/DataProtection-Keys
+
+  # 3. Redis — Realtime Speed Layer (GPS Cache, Distributed Lock, Rider Presence)
+  redis:
+    image: redis:7-alpine
+    container_name: delivery-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD}
+    environment:
+      - REDISCLI_AUTH=${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # 4. ระบบปัญญาประดิษฐ์จัดเส้นทาง (Python FastAPI)
+  route-optimizer:
+    build:
+      context: ./route-optimizer
+      dockerfile: Dockerfile
+    container_name: delivery-route-optimizer
+    environment:
+      - DATABASE_URL=postgresql://postgres@db:5432/delivery_db
+      - ROUTE_OPTIMIZER_OSRM_URL=http://osrm:5000
+      - ROUTE_OPTIMIZER_OSRM_TIMEOUT_SECONDS=2.0
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_ROLE_ID_FILE=/vault/approle/route_optimizer_role_id
+      - VAULT_SECRET_ID_FILE=/vault/approle/route_optimizer_secret_id
+      - VAULT_REQUIRED=true
+    depends_on:
+      db:
+        condition: service_healthy
+      vault-bootstrap:
+        condition: service_healthy
+      osrm:
+        condition: service_started
+    # Ports removed to isolate the container from public access (OWASP LLM10 / LLM07 API Isolation)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - vault_approle_data:/vault/approle:ro
+
+  # 5. ระบบแดชบอร์ดแอดมิน (Angular)
+  frontend:
+    build:
+      context: ./admin-dashboard
+      dockerfile: Dockerfile
+    container_name: delivery-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 6. ระบบแอปพลิเคชันสำหรับไรเดอร์ (Flutter Web)
+  rider-app:
+    build:
+      context: ./rider_app
+      dockerfile: Dockerfile
+    container_name: delivery-rider-app
+    volumes:
+      - ./rider_app/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - map_tile_cache:/var/cache/nginx/map_tiles
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+  # 7. ระบบคำนวณเส้นทางถนน Dijkstra (Offline OSRM Server)
+  osrm:
+    image: osrm/osrm-backend
+    container_name: delivery-osrm
+    user: root
+    volumes:
+      - ./osrm_data:/data
+    command: osrm-routed --algorithm mld /data/udon-thani.osrm
+    restart: unless-stopped
+
+  # 8. Nginx Reverse Proxy
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: delivery-nginx
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    volumes:
+      - ./nginx-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx-proxy/.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+
+  # 9. Seq (Centralized Logging)
+  seq:
+    image: datalust/seq:latest
+    container_name: delivery-seq
+    environment:
+      - ACCEPT_EULA=Y
+      - SEQ_FIRSTRUN_ADMINPASSWORDHASH=${SEQ_ADMIN_PASSWORD_HASH:?SEQ_ADMIN_PASSWORD_HASH must be set}
+    volumes:
+      - seq_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:80 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 10. Prometheus (Metrics)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: delivery-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/rules:/etc/prometheus/rules
+    restart: unless-stopped
+    depends_on:
+      - alertmanager
+
+  # 11. Grafana (Dashboard)
+  grafana:
+    image: grafana/grafana-enterprise
+    container_name: delivery-grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+    restart: unless-stopped
+
+  # 13. Alertmanager (Security & Operational Alerts)
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: delivery-alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    restart: unless-stopped
+
+  # 12. RabbitMQ Message Broker (Real-time Event Architecture)
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: delivery-rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD}
+    volumes:
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # 14. HashiCorp Vault (Secrets Management - Local Dev Mode)
+  vault:
+    image: hashicorp/vault:latest
+    container_name: delivery-vault
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=${VAULT_DEV_ROOT_TOKEN:?VAULT_DEV_ROOT_TOKEN must be set}
+      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+      - VAULT_ADDR=http://127.0.0.1:8200
+    volumes:
+      - vault_approle_data:/vault/approle
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "vault status >/dev/null 2>&1 || [ $$? -eq 2 ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  vault-bootstrap:
+    image: hashicorp/vault:latest
+    container_name: delivery-vault-bootstrap
+    user: "root"
+    depends_on:
+      vault:
+        condition: service_healthy
+    volumes:
+      - ./RootScripts/scripts/vault-bootstrap.sh:/vault-bootstrap.sh
+      - vault_approle_data:/vault/approle
+    environment:
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=${VAULT_DEV_ROOT_TOKEN:?VAULT_DEV_ROOT_TOKEN must be set}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - JWT_SECRET=${JWT_SECRET}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD}
+      - ROUTE_OPTIMIZER_API_KEY=${ROUTE_OPTIMIZER_API_KEY:-}
+      - AI_SERVICE_API_KEY=${AI_SERVICE_API_KEY}
+    entrypoint: ["sh", "/vault-bootstrap.sh"]
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -s /vault/approle/ready && test \"$$(cat /vault/approle/backend_role_id)\" = \"$$(vault read -field=role_id auth/approle/role/backend-role/role-id 2>/dev/null)\" && test \"$$(cat /vault/approle/route_optimizer_role_id)\" = \"$$(vault read -field=role_id auth/approle/role/route-optimizer-role/role-id 2>/dev/null)\""
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # 15. cAdvisor (Container Advisor)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: delivery-cadvisor
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    restart: unless-stopped
+
+  # 16. Node Exporter (Host Metrics)
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: delivery-node-exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    restart: unless-stopped
+
+  # 17. PostgreSQL Exporter
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: delivery-postgres-exporter
+    environment:
+      - DATA_SOURCE_NAME=postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/delivery_db?sslmode=disable
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # 18. Redis Exporter
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: delivery-redis-exporter
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  seq_data:
+  grafana_data:
+  vault_approle_data:
+  data_protection_keys:
+  map_tile_cache:

@@ -1,0 +1,40 @@
+# Project Rules: AI-Optimized Smart Delivery Routing
+
+## 1. Role & Identity
+- You are the Senior Full-stack Developer and AI Architect for this Docker-based microservices project.
+- Work production-aware and stay aligned with the current repository state.
+
+## 2. Technical Constraints
+- Backend: use .NET 8, C#, Dependency Injection, SignalR, EF Core, and NetTopologySuite.
+- AI Engine: use Python FastAPI and Google OR-Tools only unless the user explicitly asks otherwise.
+- Database: use PostgreSQL + PostGIS with SRID 4326 / WGS84.
+- Frontend: use Angular for admin and Flutter for rider flows.
+- Security: use JWT Bearer auth, role policies, rate limiting, and safe CORS configuration.
+- Secrets: never commit real secrets; use environment variables or user secrets.
+- **อย่าให้ Redis กลายเป็น source of truth (สำคัญมาก)**:
+  - **Redis**: ทำหน้าที่เป็น *operational realtime state* (เช่น GPS buffer, presence, live locks)
+  - **PostgreSQL**: ทำหน้าที่เป็น *persistent truth* (ข้อมูลสถานะ Orders, Riders, Transactions) เสมอ
+- **Single Test Hub**: รวบรวมเทสไฟล์ทั้งหมด (C# xUnit, Python PyTest, JS E2E/Load tests) ไว้ที่ `RootScripts/scripts.test/` เท่านั้น ยกเว้น Angular spec (`*.spec.ts`) ให้วางข้างคอมโพเนนต์ตามมาตรฐาน Angular CLI
+
+
+## 3. Workflow & Logging Rules
+- **CRITICAL**: ALWAYS read `AGENTS.md` and `AI-INDEX.md` FIRST before starting any task to perform Context Pruning.
+- Reference 
+1. `AI-INDEX.md` - The Master Router to find which specific spec files you need to read.
+2. `AI-BOOTSTRAP.md` - AI Behavior Rules and Anti-Hallucination constraints.
+3. `.docs/AI-CHANGELOG/` - latest project status and applied changes (read only relevant date files).
+4. `.cursorrules` - original Cursor rules and workflow constraints.
+5. **AI‑OS Docs** - After the core files, consult the appropriate spec/contract in `.docs/ai-context/` (referenced via `AI-INDEX.md`).
+- Keep changes scoped to the request and do not rewrite unrelated files.
+- Use the codebase as the source of truth when docs and code disagree.
+- Always follow the project's established base standards and architectural patterns for each specific part of the system:
+  - **Backend**: Use `CrudControllerBase` for master data, `DeliveryControllerBase` for complex logic. Always use `DBHandlerCore` for database operations. Keep controllers thin; place business logic in `BackendApi/Services/` (never in `Controllers/Services/`). Use Mapster for DTOs and `ApiResponse` for all outputs.
+  - **Frontend (Angular)**: Use `BaseApiService<T>` for standard CRUD operations, `DeliveryHttpRequest` (Fluent API) for custom calls, and OpenAPI generated models for type safety.
+  - **Mobile (Flutter)**: Follow the established foundation, use standard `ApiResponse` mappings, Dio for networking, and Riverpod for state management.
+- Do not update `.docs/AI-CHANGELOG/` automatically; ask the user every time before logging work there (create/update files based on date).
+- When updating `.docs/AI-CHANGELOG/`, ALWAYS append new logs to the end of the current date's file. DO NOT modify, overwrite, or delete historical entries.
+- Follow the project plan closely. Do not invent new features or abstractions outside the scope of the current milestone or existing base structures.
+
+## 4. Error Mitigation
+- Before npm-related work, inspect `.npmrc` and consider private registry or VPN constraints.
+- Avoid suggestive fixes that conflict with the existing project structure when the repo already has a working pattern.

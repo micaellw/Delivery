@@ -1,0 +1,348 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using BackendApi.Data;
+using BackendApi.Hubs;
+using BackendApi.Hubs.Chat;
+using BackendApi.Hubs.Tracking;
+using BackendApi.Infrastructure.Redis;
+using BackendApi.Services.Ai;
+using BackendApi.Services.Tracking;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using StackExchange.Redis;
+using BackendApi.Core.StateMachines;
+using BackendApi.Features.FleetTracking.Telemetry;
+using BackendApi.Features.FleetTracking.Models;
+using BackendApi.Security;
+using BackendApi.Security.Models;
+using BackendApi.Security.Services;
+
+namespace BackendApi.Services.Telemetry
+{
+    /// <summary>
+    /// Telemetry Service — จัดการการประมวลผลพิกัดความถี่สูงอย่างสมบูรณ์แบบ
+    /// คอยทำ Snap-to-Road (OSRM), จัดเก็บบน Redis cache เท่านั้นใน Hot path,
+    /// และทำการ Broadcast พิกัดผ่าน SignalR แบบ Dynamic Throttling
+    /// </summary>
+    public partial class TelemetryService
+    {
+        private readonly ApplicationDbContext _dbContext;
+        private readonly RiderPresenceService _presenceService;
+        private readonly IRiderPresenceManager _presenceManager;
+        private readonly GpsRedisRateLimiter _rateLimiter;
+        private readonly GpsRabbitMqPublisher _gpsPublisher;
+        private readonly TelemetryAggregator _aggregator;
+        private readonly OsrmRoutingService _routingService;
+        private readonly IHubContext<TrackingHub> _hubContext;
+        private readonly IConnectionMultiplexer _redis;
+        private readonly ILogger<TelemetryService> _logger;
+
+        private const string AdminGroup = "admins";
+        private const double CoreAccuracyThresholdMeters = 150.0;
+        private const double UiOnlyAccuracyThresholdMeters = 300.0;
+
+        public TelemetryService(
+            ApplicationDbContext dbContext,
+            RiderPresenceService presenceService,
+            IRiderPresenceManager presenceManager,
+            GpsRedisRateLimiter rateLimiter,
+            GpsRabbitMqPublisher gpsPublisher,
+            TelemetryAggregator aggregator,
+            OsrmRoutingService routingService,
+            IHubContext<TrackingHub> hubContext,
+            IConnectionMultiplexer redis,
+            ILogger<TelemetryService> logger)
+        {
+            _dbContext = dbContext;
+            _presenceService = presenceService;
+            _presenceManager = presenceManager;
+            _rateLimiter = rateLimiter;
+            _gpsPublisher = gpsPublisher;
+            _aggregator = aggregator;
+            _routingService = routingService;
+            _hubContext = hubContext;
+            _redis = redis;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// ประมวลผลและกระจายพิกัด GPS เรียลไทม์
+        /// </summary>
+        public async Task ProcessLocationUpdateAsync(
+            string riderId, 
+            double lat, 
+            double lng, 
+            double accuracy, 
+            DateTime? timestamp = null, 
+            bool bypassRateLimit = false)
+        {
+            using var scope = BeginLogScope(riderId);
+            if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return;
+
+            if (accuracy <= 50.0)
+            {
+                OperationalMetrics.GpsAccuracyPointsTotal.WithLabels("excellent").Inc();
+            }
+            else if (accuracy <= 300.0)
+            {
+                OperationalMetrics.GpsAccuracyPointsTotal.WithLabels("weak").Inc();
+            }
+            else
+            {
+                OperationalMetrics.GpsAccuracyPointsTotal.WithLabels("poor").Inc();
+            }
+
+            // Reject unusable points. Degraded points are broadcast to admins
+            // for visibility, but never enter dispatch, Redis GEO, or history.
+            if (accuracy > UiOnlyAccuracyThresholdMeters) return;
+
+            // 1.5. Level 1 Server-Side Rate Limiting (Safety net for SignalR or unthrottled REST inputs)
+            var currentQueueSize = _gpsPublisher.PendingQueueCount;
+            if (!bypassRateLimit)
+            {
+                if (await _rateLimiter.ShouldRateLimitAsync(riderId, currentQueueSize))
+                {
+                    return;
+                }
+            }
+
+            var now = timestamp ?? DateTime.UtcNow;
+            // Prevent future time spoofing (DoS)
+            if (now > DateTime.UtcNow.AddMinutes(1))
+            {
+                now = DateTime.UtcNow;
+            }
+
+            // Prevent deep historical GPS points spamming (DoS)
+            if (now < DateTime.UtcNow.AddMinutes(-15))
+            {
+                _logger.LogWarning("Discarding stale GPS point for Rider {RiderId}. Age is too old.", riderId);
+                return;
+            }
+
+            if (accuracy > CoreAccuracyThresholdMeters)
+            {
+                await BroadcastAdminLocationAsync(
+                    riderId,
+                    lat,
+                    lng,
+                    accuracy,
+                    now,
+                    isSnapped: false);
+                return;
+            }
+
+            // 3. ป้องกันการวาร์ปกระโดดข้ามพิกัดระยะไกล (Teleport Protection) - ใช้พิกัดดิบในการตรวจสอบ
+            var lastGps = await _presenceService.GetLastKnownLocationAsync(riderId);
+            bool isHistoricalPoint = false;
+            if (lastGps is not null)
+            {
+                var distMeters = HaversineDistance(lastGps.Value.Lat, lastGps.Value.Lng, lat, lng);
+                var timeDiffSeconds = (now - lastGps.Value.UpdatedAt).TotalSeconds;
+
+                if (timeDiffSeconds <= 0)
+                {
+                    // Detect if this is an older point arriving out-of-order
+                    isHistoricalPoint = true;
+                }
+                else if ((distMeters / timeDiffSeconds) > 50.0)
+                {
+                    // ความเร็วเกิน 180 km/h (50 m/s) มีความท้าทายว่าสัญญาณ GPS ผิดเพี้ยน
+                    _logger.LogWarning("GPS Teleport anomaly detected for Rider {RiderId}. Movement of {Dist}m in {Time}s ignored.", 
+                        riderId, Math.Round(distMeters, 1), Math.Round(timeDiffSeconds, 1));
+                    return;
+                }
+            }
+
+            // 4. คำนวณความเร็วจาก GPS point ก่อนหน้า (ใช้พิกัดดิบ)
+            double speedKmh = 0.0;
+            if (lastGps is not null && !isHistoricalPoint)
+            {
+                var distForSpeed = HaversineDistance(lastGps.Value.Lat, lastGps.Value.Lng, lat, lng);
+                var timeDiffForSpeed = (now - lastGps.Value.UpdatedAt).TotalSeconds;
+                if (timeDiffForSpeed > 0)
+                    speedKmh = (distForSpeed / timeDiffForSpeed) * 3.6; // m/s → km/h
+            }
+
+            var db = _redis.GetDatabase();
+
+            // 5. บันทึกพิกัดเรียลไทม์ + ความเร็วลงเฉพาะ Redis Presence Cache (ใช้พิกัดดิบ)
+            if (!isHistoricalPoint)
+            {
+                await _presenceService.UpdateGpsAsync(riderId, lat, lng, speedKmh, accuracy);
+                await _presenceManager.HandleRiderHeartbeatAsync(riderId);
+            }
+
+            // 6. โยนพิกัดดิบลงคิว RabbitMQ แบบ Durable ป้องกันข้อมูลสูญหายระดับองค์กร
+            // Background Worker จะเป็นผู้นำไป Snap และดึงเส้นทางอย่างเป็นระบบแบบ Asynchronous
+            _gpsPublisher.Publish(new TrackPoint(riderId, lat, lng, now));
+            _gpsPublisher.PublishForSnap(new TrackPoint(riderId, lat, lng, now));
+
+            // 7. เพิ่มตัวนับ GPS Tick สำหรับแสดงอัตราผ่านทางหน้าหลังบ้าน
+            _aggregator.IncrementGpsTick();
+
+            if (isHistoricalPoint)
+            {
+                // Stop processing here so old/out-of-order points are only saved to RabbitMQ (history)
+                // and do not update Presence cache or broadcast via SignalR
+                return;
+            }
+
+            // 8. จัดการ Dynamic Throttling สำหรับ Broadcast ผ่าน SignalR (ใช้พิกัดดิบ)
+            var lastBroadcastKey = $"telemetry:last_broadcast:{riderId}";
+            var lastBroadcast = await db.HashGetAllAsync(lastBroadcastKey);
+
+            double throttleSeconds = 2.0; // ค่าเริ่มต้น
+
+            if (lastBroadcast.Length > 0)
+            {
+                var latEntry = lastBroadcast.FirstOrDefault(e => e.Name == "lat");
+                var lngEntry = lastBroadcast.FirstOrDefault(e => e.Name == "lng");
+                var ticksEntry = lastBroadcast.FirstOrDefault(e => e.Name == "ticks");
+
+                if (latEntry.Value.HasValue && lngEntry.Value.HasValue && ticksEntry.Value.HasValue)
+                {
+                    var lastLat = (double)latEntry.Value;
+                    var lastLng = (double)lngEntry.Value;
+                    var lastTicks = (long)ticksEntry.Value;
+
+                    var timeDiff = (now - new DateTime(lastTicks, DateTimeKind.Utc)).TotalSeconds;
+                    var distanceMoved = HaversineDistance(lastLat, lastLng, lat, lng);
+
+                    if (timeDiff > 0)
+                    {
+                        double speed = distanceMoved / timeDiff; // เมตรต่อวินาที
+
+                        // คำนวณความถี่แบบ Dynamic ตามความเร็วของไรเดอร์
+                        if (speed > 5.0)       // เคลื่อนที่เร็ว (> 18 km/h): Broadcast ทุกๆ 1 วินาที
+                            throttleSeconds = 1.0;
+                        else if (speed > 1.5)  // เคลื่อนที่ช้า (5 - 18 km/h): Broadcast ทุกๆ 2 วินาที
+                            throttleSeconds = 2.0;
+                        else                   // หยุดนิ่ง (< 5 km/h): Broadcast ทุกๆ 5 วินาที
+                            throttleSeconds = 5.0;
+                    }
+                }
+            }
+
+            long lastTicksValue = 0;
+            if (lastBroadcast.Length > 0)
+            {
+                var ticksEntry = lastBroadcast.FirstOrDefault(e => e.Name == "ticks");
+                if (ticksEntry.Value.HasValue)
+                {
+                    lastTicksValue = (long)ticksEntry.Value;
+                }
+            }
+            var secondsSinceLast = (now - new DateTime(lastTicksValue, DateTimeKind.Utc)).TotalSeconds;
+
+            if (secondsSinceLast >= throttleSeconds)
+            {
+                // ดึงสถานะไรเดอร์ปัจจุบัน (จาก Redis Cache ก่อน เลี่ยง DB)
+                var riderState = await GetRiderStateAsync(db, riderId);
+
+                // A. ส่งพิกัดเรียลไทม์หา Admin Dashboard เท่านั้น (แบบยังไม่ได้ Snap ณ วินาทีแรก เพื่อความลื่นไหล)
+                // หมายเหตุ: ไม่ broadcast ไปหาลูกค้าจาก Hot path แล้ว เพื่อป้องกัน marker กระโดด
+                // ลูกค้าจะได้รับพิกัด Snapped จาก ProcessSnapAndBroadcastAsync (Background Worker) เท่านั้น
+                await _hubContext.Clients.Group(AdminGroup).SendAsync("RiderLocationUpdated", new
+                {
+                    RiderId = riderId,
+                    Lat = lat,
+                    Lng = lng,
+                    Accuracy = accuracy,
+                    State = riderState,
+                    Timestamp = now,
+                    isSnapped = false,
+                    snappedPolyline = (string?)null
+                });
+
+                // B. ส่งพิกัดเรียลไทม์หา Rider's own group (สำหรับ Simulation Mirror เพื่อการเคลื่อนไหวที่ลื่นไหลแบบเรียลไทม์)
+                await _hubContext.Clients.Group($"rider:{riderId}").SendAsync("RiderLocationUpdated", new
+                {
+                    RiderId = riderId,
+                    Lat = lat,
+                    Lng = lng,
+                    Accuracy = accuracy,
+                    State = riderState,
+                    Timestamp = now,
+                    isSnapped = false,
+                    snappedPolyline = (string?)null
+                });
+
+                // อัปเดตพิกัดส่งออกล่าสุดลงใน Redis
+                await db.HashSetAsync(lastBroadcastKey, new[]
+                {
+                    new HashEntry("lat", lat),
+                    new HashEntry("lng", lng),
+                    new HashEntry("ticks", now.Ticks)
+                });
+                await db.KeyExpireAsync(lastBroadcastKey, TimeSpan.FromHours(24));
+            }
+
+            // 9. ปรับปรุงฐานข้อมูลหลัก (PostgreSQL) แบบ Throttled (ทุก 10 วินาที)
+            // Legacy DB write has been completely removed from the Hot Path.
+            // The real-time location is now exclusively stored in Redis Presence Cache (Step 5).
+            // Historical tracking data is batch-inserted via RabbitMQ GpsRabbitMqConsumerWorker.
+            // We no longer lock DB threads here to prevent starvation during massive concurrency.
+        }
+
+        /// <summary>
+        /// ประมวลผลและกระจายพิกัด GPS เป็นกลุ่ม (Batch) จาก Offline Buffering
+        /// </summary>
+        public async Task ProcessLocationBatchAsync(string riderId, List<GpsBatchPointRequest> batchPoints)
+        {
+            using var scope = BeginLogScope(riderId);
+            if (batchPoints == null || batchPoints.Count == 0) return;
+
+            var minTimestamp = DateTime.UtcNow.AddMinutes(-15);
+            var maxTimestamp = DateTime.UtcNow.AddMinutes(1);
+
+            // 1. กรองจุดที่คลาดเคลื่อนเบื้องต้น (Drift Protection) ขอบเขตพิกัด และช่วงเวลาที่ยอมรับได้
+            var validPoints = batchPoints
+                .Where(p => p.Latitude >= -90 && p.Latitude <= 90 && p.Longitude >= -180 && p.Longitude <= 180 && p.Accuracy <= UiOnlyAccuracyThresholdMeters)
+                .Where(p => p.Timestamp >= minTimestamp && p.Timestamp <= maxTimestamp)
+                .OrderBy(p => p.Timestamp) // เรียงลำดับตามเวลาแบบเรียงขึ้น (Ascending)
+                .ToList();
+
+            if (validPoints.Count == 0) return;
+
+            // 2. แยกจุดล่าสุด (Latest Point) ออกจากพิกัดย้อนหลัง (Historical Points)
+            var latestPoint = validPoints.Last();
+            var historicalPoints = validPoints.Take(validPoints.Count - 1).ToList();
+
+            // 3. จัดการข้อมูลย้อนหลัง (Historical Points): ส่งตรงเข้า RabbitMQ เป็นข้อมูลดิบ (Raw Lat/Lng) เพื่อประหยัดทรัพยากร
+            if (historicalPoints.Count > 0)
+            {
+                _gpsPublisher.PublishBatch(historicalPoints
+                    .Where(point => point.Accuracy <= CoreAccuracyThresholdMeters)
+                    .Select(point => new TrackPoint(riderId, point.Latitude, point.Longitude, point.Timestamp)));
+            }
+
+            // 4. จัดการจุดล่าสุด (Latest Point): ประมวลผลลอจิกเต็มรูปแบบใน Hot Path (ผ่าน OSRM, Redis Presence, SignalR, DB Throttle)
+            // ทำการ bypassRateLimit = true เนื่องจากผ่านการเช็คระดับ Batch-Level มาแล้วจาก Controller
+            await ProcessLocationUpdateAsync(
+                riderId, 
+                latestPoint.Latitude, 
+                latestPoint.Longitude, 
+                latestPoint.Accuracy, 
+                latestPoint.Timestamp, 
+                bypassRateLimit: true);
+        }
+
+
+        private static double HaversineDistance(double lat1, double lon1, double lat2, double lon2) =>
+            BackendApi.Core.Helpers.GeoMath.HaversineDistanceMeters(lat1, lon1, lat2, lon2);
+
+        private IDisposable? BeginLogScope(string riderId)
+        {
+            return _logger.BeginScope(new Dictionary<string, object?>
+            {
+                ["CorrelationId"] = CorrelationIdProvider.GetOrCreate((HttpContext?)null),
+                ["OrderId"] = null,
+                ["RiderId"] = riderId
+            });
+        }
+    }
+}

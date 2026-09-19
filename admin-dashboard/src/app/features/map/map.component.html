@@ -1,0 +1,74 @@
+<section class="map-page">
+  <div class="map-area">
+    <div class="map-placeholder" #mapElement></div>
+
+    <!-- แผงสถานะ Fleet ของไรเดอร์ -->
+    <div class="fleet-status">
+      <strong>Fleet_Status</strong>
+      <button class="filter-btn" [class.active]="filterStatus === 'ALL'" (click)="setFilterStatus('ALL')">All</button>
+      <button class="filter-btn" [class.active]="filterStatus === 'IDLE'" (click)="setFilterStatus('IDLE')"><i class="green-dot"></i>Available ({{ availableCount }})</button>
+      <button class="filter-btn" [class.active]="filterStatus === 'BUSY'" (click)="setFilterStatus('BUSY')"><i class="blue-dot"></i>Busy ({{ busyCount }})</button>
+      <button class="filter-btn" [class.active]="filterStatus === 'OFFLINE'" (click)="setFilterStatus('OFFLINE')"><i class="gray-dot"></i>Offline ({{ offlineCount }})</button>
+    </div>
+
+    <div class="map-controls">
+      <button type="button" (click)="recenter()" title="Recenter Map">◎</button>
+      <button type="button" class="btn-map-theme" (click)="toggleMapTheme()" [title]="isDarkMode ? 'Switch to Light/Street View (Detailed Sois)' : 'Switch to Dark Mode'">{{ isDarkMode ? '🗺️' : '🌙' }}</button>
+      <button type="button" class="btn-sim-follow" [class.active]="simAutoFollow" (click)="toggleSimAutoFollow()" title="Sim Auto-Follow Focus">🎬</button>
+    </div>
+
+    <!-- Order Detail Modal (Click Pin) -->
+    @if (showOrderDetailModal && selectedOrder) {
+      <app-order-detail [order]="selectedOrder" (close)="closeOrderDetails()"></app-order-detail>
+    }
+  </div>
+
+  <aside class="fleet-panel">
+    <section class="panel-block">
+      <div class="row-between">
+        <h3>System_Alerts</h3>
+        <span class="badge red">{{ alerts.length }} Active</span>
+      </div>
+      @for (alert of alerts; track alert.title) {
+        <article class="alert" [class]="alert.tone">
+          <div class="row-between"><strong>{{ alert.title }}</strong><span>{{ alert.time }}</span></div>
+          <p>{{ alert.text }}</p>
+          @if (alert.tone === 'danger') {
+            <div class="alert-actions">RE_ROUTE&nbsp;&nbsp;DISMISS</div>
+          }
+        </article>
+      }
+      @if (!alerts.length) {
+        <article class="alert info">
+          <div class="row-between"><strong>TrackingHub</strong><span>LIVE</span></div>
+          <p>No active SignalR alerts received.</p>
+        </article>
+      }
+    </section>
+
+    <section class="panel-block riders">
+      <div class="row-between">
+        <h3>Active_Riders</h3>
+        <span class="badge">{{ riders.length }}</span>
+      </div>
+      @for (rider of riders; track rider.id) {
+        <div class="rider-row">
+          <div class="avatar">{{ rider.avatar }}</div>
+          <div>
+            <strong>{{ rider.name }}</strong>
+            <span [class]="rider.tone">{{ rider.battery }} &nbsp; {{ rider.signal }}</span>
+          </div>
+          <em>{{ rider.status }}</em>
+        </div>
+      }
+      @if (!riders.length) {
+        <div class="empty-panel">WAITING_FOR_RIDER_LOCATION_STREAM</div>
+      }
+    </section>
+
+    <div class="signal-grid">
+      <div><span>SignalR Feed</span><strong>{{ riders.length }}</strong></div>
+      <div><span>Map Center</span><strong class="orange">UDN</strong></div>
+    </div>
+  </aside>
+</section>

@@ -1,0 +1,172 @@
+<section class="riders-page">
+  <!-- ═══════════════════════════════════════════════════════════════
+       VIEW: LIST — ตารางไรเดอร์ทั้งหมด
+  ════════════════════════════════════════════════════════════════ -->
+  @if (view === 'list') {
+  <div class="section-header">
+    <div>
+      <h2>{{ title }}</h2>
+      <p>Rider fleet status, GPS coordinates, and last activity from BackendApi</p>
+    </div>
+  </div>
+
+  <!-- Live Status Connection Alert Banner -->
+  <div *ngIf="connectionStatus !== 'CONNECTED'" class="connection-banner" [ngClass]="connectionStatus.toLowerCase()">
+    <div class="banner-content">
+      <lucide-icon [img]="icons.RefreshCcw" class="spin-icon" *ngIf="connectionStatus === 'RECONNECTING'" size="14"></lucide-icon>
+      <span class="warning-icon" *ngIf="connectionStatus === 'DISCONNECTED'">⚠️</span>
+      <span>
+        {{ connectionStatus === 'RECONNECTING' ? 'สัญญาณขาดหาย กำลังพยายามเชื่อมต่อใหม่แบบเรียลไทม์...' : 'ขาดการเชื่อมต่อกับระบบเครือข่ายเรียลไทม์ ข้อมูลตำแหน่งและสถิติไรเดอร์บนหน้าจออาจไม่เป็นปัจจุบัน' }}
+      </span>
+    </div>
+  </div>
+
+  <div class="stat-grid">
+    <article>
+      <span>Total Riders</span>
+      <strong>{{ totalCount }}</strong>
+      <small>registered in system</small>
+    </article>
+    <article>
+      <span>Idle / Available</span>
+      <strong>{{ idleCount }}</strong>
+      <small>ready to receive dispatch</small>
+    </article>
+    <article>
+      <span>On Delivery</span>
+      <strong class="warning">{{ busyCount }}</strong>
+      <small>currently delivering</small>
+    </article>
+    <article>
+      <span>Offline</span>
+      <strong>{{ offlineCount }}</strong>
+      <small>disconnected from hub</small>
+    </article>
+  </div>
+
+  <!-- Top Performers Section -->
+  <div class="top-riders-section" *ngIf="topRiders.length > 0">
+    <div class="section-subtitle">Top Performers</div>
+    <div class="top-riders-grid">
+      <article *ngFor="let tr of topRiders">
+        <div class="tr-info">
+          <strong>{{ tr.name || 'Rider' }}</strong>
+          <span>{{ tr.completedDeliveries }} Deliveries</span>
+        </div>
+        <div class="tr-stats">
+          <small>Avg. {{ tr.averageDeliveryTimeMinutes }} min</small>
+          <small class="primary">฿{{ tr.totalEarned }}</small>
+        </div>
+      </article>
+    </div>
+  </div>
+
+  <app-data-table 
+    [title]="'Rider_Manifest'"
+    [columns]="columns"
+    [data]="riders"
+    [totalCount]="totalCount"
+    [currentPage]="currentPage"
+    [pageSize]="pageSize"
+    [searchQuery]="query"
+    [isLoading]="isLoading"
+    [hasError]="hasError"
+    [hasActions]="true"
+    (pageChange)="onPageChange($event)"
+    (search)="onSearch($event)"
+    (sortChange)="onSortChange($event)"
+    (refresh)="loadRiders()"
+    (retry)="loadRiders()">
+    
+    <ng-template #cellTemplate let-item let-col="col">
+      @if (col.field === 'id') {
+        <span class="mono primary">{{ getRiderTrackingCode(item) }}</span>
+      }
+      @else if (col.field === 'name') {
+        {{ item.name || '—' }}
+      }
+      @else if (col.field === 'phone') {
+        <span class="mono">{{ item.phone || '—' }}</span>
+      }
+      @else if (col.field === 'rating') {
+        <span class="rating-cell">
+          ★ {{ item.rating || '5.0' }}
+        </span>
+      }
+      @else if (col.field === 'status') {
+        <span class="status" [class]="getStatusTone(item.status)">{{ item.status || 'UNKNOWN' }}</span>
+      }
+      @else if (col.field === 'lat') {
+        <span class="mono">
+          @if (item.lat != null) {
+            <lucide-icon [img]="icons.MapPin" size="12"></lucide-icon>
+            {{ formatCoord(item.lat) }}
+          } @else {
+            —
+          }
+        </span>
+      }
+      @else if (col.field === 'lng') {
+        <span class="mono">{{ formatCoord(item.lng) }}</span>
+      }
+      @else if (col.field === 'lastUpdated') {
+        <span class="mono">{{ formatTime(item.lastUpdated) }}</span>
+      }
+      @else {
+        {{ item[col.field] }}
+      }
+    </ng-template>
+
+    <ng-template #actionTemplate let-item>
+      <button type="button" class="ghost-action" (click)="toggleStatus(item)" [title]="item.status === 'IDLE' ? 'Set Offline' : 'Set Idle'">
+        <lucide-icon [img]="icons.RefreshCcw" size="14"></lucide-icon>
+        Toggle
+      </button>
+      <button type="button" class="ghost-action" (click)="startEdit(item)">
+        <lucide-icon [img]="icons.Pencil" size="14"></lucide-icon>
+        Edit
+      </button>
+      <button type="button" class="ghost-action history-action" (click)="openHistory(item)">
+        <lucide-icon [img]="icons.History" size="14"></lucide-icon>
+        History
+      </button>
+      <button type="button" class="danger-action" (click)="deleteRider(item)">
+        <lucide-icon [img]="icons.Trash2" size="14"></lucide-icon>
+        Delete
+      </button>
+    </ng-template>
+  </app-data-table>
+
+  <app-rider-edit-modal 
+    [isOpen]="isEditModalOpen" 
+    [rider]="selectedRider"
+    (closed)="closeEditModal()" 
+    (saved)="saveModalEdit($event)"
+    (historyRequested)="openHistory($event)">
+  </app-rider-edit-modal>
+
+  } <!-- end @if (view === 'list') -->
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       VIEW: ROUTE MAP — แผนที่ GPS ออเดอร์ที่เลือก
+  ════════════════════════════════════════════════════════════════ -->
+  @if (view === 'route-map') {
+    <app-rider-route-map
+      [rider]="routeMapRider"
+      [order]="routeMapOrder"
+      [isVisible]="view === 'route-map'"
+      (back)="onBackFromRouteMap()">
+    </app-rider-route-map>
+  }
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       SHARED OVERLAYS — แสดงบนทั้งสอง view
+  ════════════════════════════════════════════════════════════════ -->
+  <app-rider-history-modal
+    [isOpen]="isHistoryModalOpen"
+    [rider]="historyRider"
+    (closed)="closeHistoryModal()"
+    (orderSelected)="onOrderSelectedForMap($event)">
+  </app-rider-history-modal>
+
+</section>

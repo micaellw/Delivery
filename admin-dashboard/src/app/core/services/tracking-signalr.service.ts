@@ -1,0 +1,435 @@
+import { Injectable } from '@angular/core';
+import * as signalR from '@microsoft/signalr';
+import { environment } from '../../../environments/environment';
+import { AuthService } from './auth.service';
+import { HttpClient } from '@angular/common/http';
+import { BehaviorSubject, Observable, Subject } from 'rxjs';
+import { RealtimeTelemetryDto, RiderUtilizationDto } from './analytics.service';
+import { ToastService } from './toast.service';
+
+export interface RiderLocationUpdate {
+  riderId: string;
+  latitude: number;
+  longitude: number;
+  snappedLat?: number;
+  snappedLng?: number;
+  isSnapped?: boolean;
+  speedKmh?: number;
+  accuracy?: number;
+  status: string; // OFFLINE, IDLE, RESERVED, BUSY, STALE
+  timestamp: string;
+}
+
+export interface DispatchOffer {
+  offerId: string;
+  version: number;
+  expiresAt: string;
+  riderId?: string;
+  pickupRoute?: any;
+  order: any;
+}
+
+export interface DispatchScanStarted {
+  order: any;
+  pickupLat: number;
+  pickupLng: number;
+  searchRadiusKm: number;
+  dispatchAttempt: number;
+  nearbyRiders: any[];
+  startedAt: string;
+}
+
+export function getDispatchScanKey(data: DispatchScanStarted): string | null {
+  const orderId = data.order?.id ?? data.order?.Id;
+  const attempt = data.dispatchAttempt ?? (data as any).DispatchAttempt;
+  if (!orderId || !Number.isFinite(Number(attempt))) return null;
+  return `${orderId}:${Number(attempt)}`;
+}
+
+export interface OrderStatusChangedPayload {
+  orderId: string;
+  orderRefNumber?: string;
+  previousStatus?: string | null;
+  newStatus: string;
+  riderId?: string | null;
+  timestamp?: string;
+}
+
+@Injectable({
+  providedIn: 'root'
+})
+export class TrackingSignalRService {
+  private hubConnection: signalR.HubConnection | null = null;
+  
+  private _riderLocations = new BehaviorSubject<Map<string, RiderLocationUpdate>>(new Map());
+  public riderLocations$ = this._riderLocations.asObservable();
+
+  private _alerts = new BehaviorSubject<any[]>([]);
+  public alerts$ = this._alerts.asObservable();
+
+  // สตรีมสำหรับสถานะการเปิด/ปิดร้านค้า
+  private _shopStatusChanged = new Subject<{ shopId: string; isOpen: boolean }>();
+  public shopStatusChanged$ = this._shopStatusChanged.asObservable();
+
+  // สตรีมสำหรับตรวจสอบสถานะเน็ตเวิร์กของบอร์ด
+  private _connectionStatus = new BehaviorSubject<'CONNECTED' | 'DISCONNECTED' | 'RECONNECTING'>('DISCONNECTED');
+  public connectionStatus$ = this._connectionStatus.asObservable();
+
+  // New Observables for Map component to track dispatch phases
+  private _offerReceived = new Subject<DispatchOffer>();
+  public offerReceived$ = this._offerReceived.asObservable();
+
+  private _dispatchScanStarted = new Subject<DispatchScanStarted>();
+  public dispatchScanStarted$ = this._dispatchScanStarted.asObservable();
+
+  private _dispatchCandidatesRanked = new Subject<any>();
+  public dispatchCandidatesRanked$ = this._dispatchCandidatesRanked.asObservable();
+
+  private _orderAssigned = new Subject<{ id: string; riderId: string; assignedAt: string }>();
+  public orderAssigned$ = this._orderAssigned.asObservable();
+
+  private _orderStatusChanged = new Subject<{ orderId: string; status: string }>();
+  public orderStatusChanged$ = this._orderStatusChanged.asObservable();
+
+  private _telemetryUpdated = new BehaviorSubject<{ telemetry: RealtimeTelemetryDto; utilization: RiderUtilizationDto } | null>(null);
+  public telemetryUpdated$ = this._telemetryUpdated.asObservable();
+
+  private _orderCreated = new Subject<any>();
+  public orderCreated$ = this._orderCreated.asObservable();
+
+  private _orderAcceptedByStore = new Subject<{ orderId: string; status: string }>();
+  public orderAcceptedByStore$ = this._orderAcceptedByStore.asObservable();
+  private readonly seenDispatchScans = new Set<string>();
+
+  constructor(
+    private authService: AuthService,
+    private toastService: ToastService,
+    private http: HttpClient
+  ) {}
+
+  public fetchInitialLocations(): void {
+    const url = environment.config.baseConfig.apiUrl.replace('/api/v1', '') + '/api/v1/rider-locations';
+    this.http.get<any>(url).subscribe({
+      next: (response) => {
+        const success = response?.success ?? response?.Success ?? response?.isSuccess;
+        const riders = response?.value ?? response?.Value ?? response?.data;
+        if (success === true && Array.isArray(riders)) {
+          const currentMap = new Map(this._riderLocations.getValue());
+          for (const rider of riders) {
+            const riderId = rider.riderId || rider.RiderId;
+            const rawLat = this.toCoordinate(rider.lat ?? rider.Lat, -90, 90);
+            const rawLng = this.toCoordinate(rider.lng ?? rider.Lng, -180, 180);
+            if (!riderId || rawLat === null || rawLng === null ||
+                (rawLat === 0 && rawLng === 0)) continue;
+
+            currentMap.set(riderId, {
+              riderId,
+              latitude: rawLat,
+              longitude: rawLng,
+              snappedLat: rider.snappedLat ?? rider.SnappedLat,
+              snappedLng: rider.snappedLng ?? rider.SnappedLng,
+              isSnapped: rider.isSnapped ?? rider.IsSnapped ?? false,
+              speedKmh: rider.speedKmh ?? rider.SpeedKmh ?? 0,
+              accuracy: rider.accuracy ?? rider.Accuracy ?? 0,
+              status: rider.state ?? rider.State ?? rider.status ?? rider.Status ?? 'OFFLINE',
+              timestamp: rider.updatedAt ?? rider.UpdatedAt ?? new Date().toISOString()
+            });
+          }
+          this._riderLocations.next(currentMap);
+        }
+      },
+      error: (err) => console.error('Failed to fetch initial rider locations from Redis API', err)
+    });
+  }
+
+  public getRiderLocations(): Map<string, RiderLocationUpdate> {
+    return this._riderLocations.getValue();
+  }
+
+  public startConnection(): void {
+    if (this.hubConnection?.state === signalR.HubConnectionState.Connected) {
+      return; // Already connected
+    }
+
+    const token = this.authService.getToken();
+    const hubUrl = environment.config.baseConfig.apiUrl.replace('/api/v1', '/hubs/tracking');
+
+    this.hubConnection = new signalR.HubConnectionBuilder()
+      .withUrl(hubUrl, {
+        accessTokenFactory: token ? () => token : undefined,
+        transport: signalR.HttpTransportType.WebSockets,
+        skipNegotiation: true // Important for pure WebSockets
+      })
+      .withAutomaticReconnect([0, 2000, 5000, 10000, 30000]) // Retry logic
+      .build();
+
+    this.addListeners();
+
+    this.hubConnection.start()
+      .then(() => {
+        console.log('SignalR connected to TrackingHub');
+        this._connectionStatus.next('CONNECTED');
+        this.addAlert('System', 'Connected to real-time dispatch network.', 'success');
+      })
+      .catch(err => {
+        console.error('Error while starting connection: ' + err);
+        this._connectionStatus.next('DISCONNECTED');
+        this.addAlert('Error', 'Failed to connect to real-time server.', 'danger');
+      });
+      
+    this.hubConnection.onreconnecting(error => {
+      console.warn('SignalR Reconnecting...', error);
+      this._connectionStatus.next('RECONNECTING');
+      this.addAlert('Warning', 'Connection lost. Reconnecting...', 'warning');
+      const url = environment.config.baseConfig.apiUrl.replace('/api/v1', '') + '/api/v1/telemetry/client-events';
+      this.http.post(url, {
+        eventType: 'reconnecting',
+        clientType: 'ADMIN',
+        details: error?.message || 'SignalR connection lost, attempting reconnect'
+      }).subscribe({
+        error: (err) => console.error('Failed to log reconnecting event to backend telemetry', err)
+      });
+    });
+
+    this.hubConnection.onreconnected(connectionId => {
+      console.log('SignalR Reconnected.', connectionId);
+      this._connectionStatus.next('CONNECTED');
+      this.addAlert('System', 'Connection restored.', 'success');
+      
+      // Jitter: สุ่มดีเลย์ 1-3 วินาทีก่อนดึงพิกัดใหม่ เพื่อกระจายโหลด (ป้องกัน Thundering Herd)
+      const jitter = Math.floor(Math.random() * 2000) + 1000;
+      setTimeout(() => {
+        this.fetchInitialLocations();
+      }, jitter);
+    });
+
+    this.hubConnection.onclose(error => {
+      console.error('SignalR Connection closed.', error);
+      this._connectionStatus.next('DISCONNECTED');
+    });
+  }
+
+  private addListeners(): void {
+    if (!this.hubConnection) return;
+
+    this.hubConnection.on('TelemetryUpdated', (data: any) => {
+      const telemetry = data.telemetry || data.Telemetry;
+      const utilization = data.utilization || data.Utilization;
+      if (telemetry && utilization) {
+        this._telemetryUpdated.next({
+          telemetry: {
+            activeRidersCount: telemetry.activeRidersCount ?? telemetry.ActiveRidersCount ?? 0,
+            gpsUpdatesPerSecond: telemetry.gpsUpdatesPerSecond ?? telemetry.GpsUpdatesPerSecond ?? 0,
+            dispatchQueueSize: telemetry.dispatchQueueSize ?? telemetry.DispatchQueueSize ?? 0
+          },
+          utilization: {
+            ridersBusyCount: utilization.ridersBusyCount ?? utilization.RidersBusyCount ?? 0,
+            ridersIdleCount: utilization.ridersIdleCount ?? utilization.RidersIdleCount ?? 0,
+            ridersOfflineCount: utilization.ridersOfflineCount ?? utilization.RidersOfflineCount ?? 0,
+            averageDeliveriesPerRider: utilization.averageDeliveriesPerRider ?? utilization.AverageDeliveriesPerRider ?? 0
+          }
+        });
+      }
+    });
+
+    // Listen to rider location updates with robust coordinate property mapping
+    this.hubConnection.on('RiderLocationUpdated', (data: any) => {
+      const currentMap = new Map(this._riderLocations.getValue());
+      const riderId = data.riderId || data.RiderId;
+      const latitude = this.toCoordinate(
+        data.latitude ?? data.lat ?? data.Lat,
+        -90,
+        90
+      );
+      const longitude = this.toCoordinate(
+        data.longitude ?? data.lng ?? data.Lng,
+        -180,
+        180
+      );
+      if (!riderId || latitude === null || longitude === null ||
+          (latitude === 0 && longitude === 0)) return;
+      
+      const mappedData: RiderLocationUpdate = {
+        riderId,
+        latitude,
+        longitude,
+        snappedLat: data.snappedLat != null ? data.snappedLat : (data.SnappedLat != null ? data.SnappedLat : undefined),
+        snappedLng: data.snappedLng != null ? data.snappedLng : (data.SnappedLng != null ? data.SnappedLng : undefined),
+        isSnapped: data.isSnapped != null ? data.isSnapped : (data.IsSnapped != null ? data.IsSnapped : false),
+        status: data.state || data.State || data.status || data.Status || 'OFFLINE',
+        speedKmh: data.speedKmh ?? data.SpeedKmh ?? 0, // Added to resolve BUG-22
+        accuracy: data.accuracy ?? data.Accuracy ?? 0,
+        timestamp: data.timestamp || data.Timestamp || new Date().toISOString()
+      };
+
+      currentMap.set(mappedData.riderId, mappedData);
+      this._riderLocations.next(currentMap);
+    });
+
+    // Listen to rider status updates (e.g. online, offline, idle)
+    this.hubConnection.on('RiderStatusUpdated', (data: any) => {
+      const currentMap = this._riderLocations.getValue();
+      const riderId = data.riderId || data.RiderId;
+      const newStatus = data.newStatus || data.NewStatus || 'OFFLINE';
+      const lat = data.lat ?? data.Lat ?? null;
+      const lng = data.lng ?? data.Lng ?? null;
+
+      const existing = currentMap.get(riderId);
+      if (existing) {
+        // อัปเดต status (และพิกัดถ้ามี) ของ Rider ที่มีอยู่แล้ว
+        currentMap.set(riderId, {
+          ...existing,
+          status: newStatus,
+          // อัปเดตพิกัดเฉพาะเมื่อ backend ส่งมาและไม่ใช่ 0,0
+          latitude: (lat !== null && lat !== 0) ? lat : existing.latitude,
+          longitude: (lng !== null && lng !== 0) ? lng : existing.longitude,
+          timestamp: data.timestamp || data.Timestamp || new Date().toISOString()
+        });
+      } else if (lat !== null && lng !== null && (lat !== 0 || lng !== 0)) {
+        // สร้าง entry ใหม่เฉพาะเมื่อมีพิกัดที่ถูกต้อง (ป้องกัน marker ที่ 0,0)
+        currentMap.set(riderId, {
+          riderId,
+          latitude: lat,
+          longitude: lng,
+          status: newStatus,
+          timestamp: data.timestamp || data.Timestamp || new Date().toISOString()
+        });
+      }
+      // ถ้า Rider ใหม่ไม่มีพิกัด → ยังไม่สร้าง marker รอ RiderLocationUpdated ครั้งแรก
+      this._riderLocations.next(new Map(currentMap));
+      this.addAlert('Rider Status', `Rider ${riderId.substring(0, 6).toUpperCase()} → ${newStatus}`, 'info');
+    });
+
+    // Listen to OSRM road-snapped updates
+    this.hubConnection.on('RiderLocationSnapped', (data: any) => {
+      const currentMap = new Map(this._riderLocations.getValue());
+      const riderId = data.riderId || data.RiderId;
+      const existing = currentMap.get(riderId);
+      const latitude = this.toCoordinate(
+        data.latitude ?? data.lat ?? data.Lat,
+        -90,
+        90
+      );
+      const longitude = this.toCoordinate(
+        data.longitude ?? data.lng ?? data.Lng,
+        -180,
+        180
+      );
+      if (!riderId || latitude === null || longitude === null ||
+          (latitude === 0 && longitude === 0)) return;
+      
+      const mappedData: RiderLocationUpdate = {
+        riderId: riderId,
+        latitude: existing?.latitude ?? latitude,
+        longitude: existing?.longitude ?? longitude,
+        snappedLat: latitude,
+        snappedLng: longitude,
+        isSnapped: true,
+        status: data.state || data.State || data.status || data.Status || existing?.status || 'OFFLINE',
+        timestamp: data.timestamp || data.Timestamp || new Date().toISOString()
+      };
+
+      currentMap.set(mappedData.riderId, mappedData);
+      this._riderLocations.next(currentMap);
+    });
+
+    // OfferReceived — Backend ยิงไปหา Rider โดยตรง (group rider:{id})
+    this.hubConnection.on('OfferReceived', (offer: DispatchOffer) => {
+      this.addAlert('AI Dispatcher', `Offer sent to rider (Order ${offer.order?.id?.slice(0, 8) || 'Unknown'})`, 'info');
+      this._offerReceived.next(offer);
+    });
+
+    this.hubConnection.on('DispatchScanStarted', (data: DispatchScanStarted) => {
+      const scanKey = getDispatchScanKey(data);
+      if (scanKey) {
+        if (this.seenDispatchScans.has(scanKey)) return;
+        this.seenDispatchScans.add(scanKey);
+        if (this.seenDispatchScans.size > 200) {
+          const oldestKey = this.seenDispatchScans.values().next().value;
+          if (oldestKey) this.seenDispatchScans.delete(oldestKey);
+        }
+      }
+      const count = data.nearbyRiders?.length ?? 0;
+      this.addAlert('AI Scan', `Scanning ${count} nearby riders for Order ${data.order?.id?.slice(0, 8) || 'Unknown'}`, 'info');
+      this._dispatchScanStarted.next(data);
+    });
+
+    this.hubConnection.on('DispatchCandidatesRanked', (data: any) => {
+      const winner = data.rankedCandidates?.[0]?.riderId || data.RankedCandidates?.[0]?.RiderId;
+      this.addAlert('AI Rank', winner ? `Best rider candidate: ${winner.slice(0, 8)}` : 'Ranking completed', 'info');
+      this._dispatchCandidatesRanked.next(data);
+    });
+
+    this.hubConnection.on('DispatchOfferSent', (offer: DispatchOffer) => {
+      this.addAlert('Dispatch Offer', `Offer sent to Rider ${offer.riderId?.slice(0, 8) || 'Unknown'}`, 'info');
+      this._offerReceived.next(offer);
+    });
+
+    // OrderAssigned — Backend broadcast ไปหา group admins เมื่อ Rider รับงาน
+    this.hubConnection.on('OrderAssigned', (data: { id: string; riderId: string; assignedAt: string }) => {
+      this.addAlert('Dispatch', `Order ${data.id?.slice(0, 8)} assigned to Rider ${data.riderId?.slice(0, 8)}`, 'success');
+      this._orderAssigned.next(data);
+    });
+
+    // OrderStatusChanged — broadcast สถานะ Order เปลี่ยน
+    this.hubConnection.on('OrderStatusChanged', (...args: any[]) => {
+      const payload = args[0] as OrderStatusChangedPayload | string | undefined;
+      const orderId = typeof payload === 'object' && payload !== null
+        ? payload.orderId ?? (payload as any).OrderId
+        : payload ?? '';
+      const newStatus = typeof payload === 'object' && payload !== null
+        ? payload.newStatus ?? (payload as any).NewStatus ?? (payload as any).status ?? (payload as any).Status
+        : args[1] ?? '';
+      if (!orderId || !newStatus) return;
+      this.addAlert('Order Update', `Order ${orderId?.slice(0, 8)} → ${newStatus}`, 'info');
+      this._orderStatusChanged.next({ orderId, status: newStatus });
+    });
+
+    this.hubConnection.on('OrderCreated', (data: any) => {
+      this._orderCreated.next(data);
+    });
+
+    this.hubConnection.on('OrderAcceptedByStore', (data: { orderId: string; status: string }) => {
+      this._orderAcceptedByStore.next(data);
+    });
+
+    this.hubConnection.on('ShopStatusChanged', (data: any) => {
+      const shopId = data.shopId || data.ShopId;
+      const isOpen = data.isOpen ?? data.IsOpen ?? false;
+      if (shopId) {
+        this._shopStatusChanged.next({ shopId, isOpen });
+      }
+    });
+  }
+
+  public stopConnection(): void {
+    if (this.hubConnection) {
+      this.hubConnection.stop();
+      this.hubConnection = null;
+    }
+  }
+
+  private addAlert(title: string, text: string, tone: string) {
+    const currentAlerts = this._alerts.getValue();
+    const newAlert = {
+      title, text, tone, time: new Date().toLocaleTimeString()
+    };
+    
+    // Map tone to toast type
+    let type: 'success' | 'error' | 'warning' | 'info' = 'info';
+    if (tone === 'success') type = 'success';
+    if (tone === 'danger') type = 'error';
+    if (tone === 'warning') type = 'warning';
+    
+    this.toastService.show(title, text, type);
+
+    // Keep only last 10 alerts for local observable fallback
+    this._alerts.next([newAlert, ...currentAlerts].slice(0, 10));
+  }
+
+  private toCoordinate(value: unknown, min: number, max: number): number | null {
+    const parsed = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(parsed) || parsed < min || parsed > max) return null;
+    return parsed;
+  }
+}

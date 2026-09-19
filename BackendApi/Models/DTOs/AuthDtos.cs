@@ -1,0 +1,101 @@
+using System.ComponentModel.DataAnnotations;
+
+namespace BackendApi.Models.DTOs;
+
+/// <summary>
+/// DTO สำหรับ Login Request
+/// </summary>
+public class LoginRequest
+{
+    /// <summary>อีเมลผู้ใช้</summary>
+    [Required(ErrorMessage = "กรุณากรอกอีเมล")]
+    [EmailAddress(ErrorMessage = "รูปแบบอีเมลไม่ถูกต้อง")]
+    public string Email { get; set; } = string.Empty;
+
+    /// <summary>รหัสผ่าน</summary>
+    [Required(ErrorMessage = "กรุณากรอกรหัสผ่าน")]
+    [MaxLength(128, ErrorMessage = "รหัสผ่านต้องยาวไม่เกิน 128 ตัวอักษร")]
+    public string Password { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// DTO สำหรับ Register Request
+/// </summary>
+public class RegisterRequest
+{
+    /// <summary>อีเมลผู้ใช้</summary>
+    [Required(ErrorMessage = "กรุณากรอกอีเมล")]
+    [EmailAddress(ErrorMessage = "รูปแบบอีเมลไม่ถูกต้อง")]
+    public string Email { get; set; } = string.Empty;
+
+    /// <summary>รหัสผ่าน (ขั้นต่ำ 12 ตัวอักษร)</summary>
+    [Required(ErrorMessage = "กรุณากรอกรหัสผ่าน")]
+    [StringLength(128, MinimumLength = 12, ErrorMessage = "รหัสผ่านต้องมีความยาว 12 ถึง 128 ตัวอักษร")]
+    public string Password { get; set; } = string.Empty;
+
+    /// <summary>ชื่อ-นามสกุล</summary>
+    [Required(ErrorMessage = "กรุณากรอกชื่อ-นามสกุล")]
+    [MaxLength(100)]
+    public string FullName { get; set; } = string.Empty;
+
+    /// <summary>บทบาทสำหรับการสมัครสาธารณะ: Customer, Rider, StorePartner</summary>
+    [MaxLength(20)]
+    public string Role { get; set; } = "Customer";
+}
+
+/// <summary>
+/// DTO สำหรับ Refresh Token Request
+/// </summary>
+public class RefreshTokenRequest
+{
+    /// <summary>Refresh Token ที่ได้จาก Login/Register</summary>
+    public string RefreshToken { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// DTO สำหรับ Auth Response — ส่งกลับหลัง Login / Register / Refresh สำเร็จ
+/// </summary>
+public class AuthResponse
+{
+    /// <summary>JWT Access Token</summary>
+    [System.Text.Json.Serialization.JsonPropertyName("accessToken")]
+    public string AccessToken { get; set; } = string.Empty;
+
+    /// <summary>Refresh Token — ใช้ขอ Access Token ใหม่เมื่อหมดอายุ</summary>
+    public string RefreshToken { get; set; } = string.Empty;
+
+    /// <summary>เวลาหมดอายุของ Access Token (UTC)</summary>
+    public DateTime ExpiresAt { get; set; }
+
+    /// <summary>ข้อมูลผู้ใช้</summary>
+    public UserInfo User { get; set; } = new();
+}
+
+/// <summary>
+/// ข้อมูลผู้ใช้ที่ส่งกลับ (ไม่มี password)
+/// </summary>
+public class UserInfo
+{
+    public string Id { get; set; } = string.Empty;
+    public string TrackingCode { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string FullName { get; set; } = string.Empty;
+    public string Role { get; set; } = string.Empty;
+    public string? RiderId { get; set; }
+    public string? ShopId { get; set; }
+}
+
+/// <summary>
+/// DTO สำหรับการขอเปลี่ยนรหัสผ่าน
+/// </summary>
+public class ChangePasswordRequest
+{
+    /// <summary>รหัสผ่านปัจจุบัน</summary>
+    [Required(ErrorMessage = "กรุณากรอกรหัสผ่านปัจจุบัน")]
+    public string CurrentPassword { get; set; } = string.Empty;
+
+    /// <summary>รหัสผ่านใหม่ (ขั้นต่ำ 12 ตัวอักษร)</summary>
+    [Required(ErrorMessage = "กรุณากรอกรหัสผ่านใหม่")]
+    [StringLength(128, MinimumLength = 12, ErrorMessage = "รหัสผ่านใหม่ต้องมีความยาว 12 ถึง 128 ตัวอักษร")]
+    public string NewPassword { get; set; } = string.Empty;
+}

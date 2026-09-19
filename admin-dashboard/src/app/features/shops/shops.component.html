@@ -1,0 +1,164 @@
+<section class="shops-page">
+  <div class="section-header">
+    <div>
+      <h2>{{ title }}</h2>
+      <p>Shop registry, menu details, and spatial coordinates from BackendApi</p>
+    </div>
+  </div>
+
+  <div class="stat-grid">
+    <article>
+      <span>Total Shops</span>
+      <strong>{{ totalCount }}</strong>
+      <small>registered in system</small>
+    </article>
+    <article>
+      <span>Current Page</span>
+      <strong>{{ currentPage }}</strong>
+      <small>out of {{ Math.ceil(totalCount / pageSize) || 1 }} pages</small>
+    </article>
+  </div>
+
+  <app-data-table 
+    [title]="'Shop_Registry'"
+    [columns]="columns"
+    [data]="shops"
+    [totalCount]="totalCount"
+    [currentPage]="currentPage"
+    [pageSize]="pageSize"
+    [searchQuery]="query"
+    [isLoading]="isLoading"
+    [hasError]="hasError"
+    [hasActions]="true"
+    (pageChange)="onPageChange($event)"
+    (search)="onSearch($event)"
+    (sortChange)="onSortChange($event)"
+    (refresh)="loadShops()"
+    (retry)="loadShops()">
+    
+    <ng-template #cellTemplate let-item let-col="col">
+      @if (col.field === 'id') {
+        <span class="mono primary">{{ getShopTrackingCode(item) }}</span>
+      }
+      @else if (col.field === 'isOpen') {
+        <span class="status" [ngClass]="item.isOpen ? 'green' : 'gray'">
+          {{ item.isOpen ? 'OPEN' : 'CLOSED' }}
+        </span>
+      }
+      @else if (col.field === 'name') {
+        @if (editingId === item.id) {
+          <input class="inline-input" [(ngModel)]="editSnapshot.name" />
+        } @else {
+          {{ item.name }}
+        }
+      }
+      @else if (col.field === 'menuName') {
+        @if (editingId === item.id) {
+          <input class="inline-input" [(ngModel)]="editSnapshot.menuName" />
+        } @else {
+          {{ item.menuName }}
+        }
+      }
+      @else if (col.field === 'menuItems') {
+        <button type="button" class="ghost-action" (click)="loadMenuItems(item.id!)">
+          <lucide-icon [img]="icons.Menu" size="14"></lucide-icon>
+          View Menu
+        </button>
+      }
+      @else if (col.field === 'menuPrice') {
+        @if (editingId === item.id) {
+          <input class="inline-input price-input" type="number" min="1" [(ngModel)]="editSnapshot.menuPrice" />
+        } @else {
+          {{ item.menuPrice | number:'1.0-0' }}
+        }
+      }
+      @else if (col.field === 'lat' || col.field === 'lng') {
+        <span class="mono">{{ formatCoord(item[col.field]) }}</span>
+      }
+      @else if (col.field === 'createdAt') {
+        <span class="mono">{{ formatDate(item.createdAt) }}</span>
+      }
+      @else {
+        {{ item[col.field] }}
+      }
+    </ng-template>
+
+    <ng-template #actionTemplate let-item>
+      @if (editingId === item.id) {
+        <button type="button" class="ghost-action" (click)="saveEdit(item)">
+          <lucide-icon [img]="icons.Check" size="14"></lucide-icon>
+          Save
+        </button>
+        <button type="button" class="muted-action" (click)="cancelEdit()">
+          <lucide-icon [img]="icons.X" size="14"></lucide-icon>
+          Cancel
+        </button>
+      } @else {
+        <button type="button" class="ghost-action" (click)="startEdit(item)">
+          <lucide-icon [img]="icons.Pencil" size="14"></lucide-icon>
+          Edit
+        </button>
+        <button type="button" class="danger-action" (click)="deleteShop(item)">
+          <lucide-icon [img]="icons.Trash2" size="14"></lucide-icon>
+          Delete
+        </button>
+      }
+    </ng-template>
+  </app-data-table>
+
+  <!-- Menu Items Modal -->
+  @if (isMenuModalOpen && selectedShopId) {
+    <div class="modal-overlay" (click)="closeMenuModal()">
+      <div class="modal-content" (click)="$event.stopPropagation()">
+        <div class="modal-header">
+          <h3>Menu Items</h3>
+          <button type="button" class="close-btn" (click)="closeMenuModal()">
+            <lucide-icon [img]="icons.X" size="20"></lucide-icon>
+          </button>
+        </div>
+        <div class="modal-body">
+          <p class="shop-info">Shop ID: {{ getSelectedShopTrackingCode() }}</p>
+          @if (menuItems.length > 0) {
+            <div class="menu-list">
+              @for (item of menuItems; track item.id) {
+                <div class="menu-item-card">
+                  <div class="menu-item-header">
+                    <h4>{{ item.name }}</h4>
+                    <span class="price">{{ item.price | number:'1.0-0' }} ฿</span>
+                  </div>
+                  @if (item.description) {
+                    <p class="description">{{ item.description }}</p>
+                  }
+                  @if (item.options && item.options.length > 0) {
+                    <div class="options-list">
+                      @for (option of item.options; track option.id) {
+                        <div class="option-group">
+                          <div class="option-header">
+                            <span>{{ option.name }}</span>
+                            @if (option.required) {
+                              <span class="required-badge">Required</span>
+                            }
+                          </div>
+                          <div class="option-items">
+                            @for (itemOption of option.items; track itemOption.name) {
+                              <span class="option-item">{{ itemOption.name }} (+{{ itemOption.price | number:'1.0-0' }} ฿)</span>
+                            }
+                          </div>
+                        </div>
+                      }
+                    </div>
+                  }
+                </div>
+              }
+            </div>
+          } @else {
+            <p class="empty-menu">No menu items found for this shop.</p>
+          }
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="primary-btn" (click)="closeMenuModal()">Close</button>
+        </div>
+      </div>
+    </div>
+  }
+</section>

@@ -1,0 +1,71 @@
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  pgbouncer:
+    ports:
+      - "127.0.0.1:6432:5432"
+
+  backend:
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - Authentication__RequireSecureCookie=false
+      - RateLimiting__Global__PermitLimit=50000
+      - RateLimiting__Auth__PermitLimit=50000
+    ports:
+      - "127.0.0.1:5000:80"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  route-optimizer:
+    ports:
+      - "127.0.0.1:8009:8000"
+
+  frontend:
+    ports:
+      - "127.0.0.1:4201:80"
+
+  nginx-proxy:
+    ports:
+      - "80:80"
+
+  rider-app:
+    build:
+      args:
+        ENABLE_MOCK_GPS: "true"
+    ports:
+      - "127.0.0.1:8083:80"
+
+  osrm:
+    ports:
+      - "127.0.0.1:5001:5000"
+
+
+  seq:
+    ports:
+      - "127.0.0.1:5341:5341"
+      - "127.0.0.1:8082:80"
+
+  prometheus:
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  alertmanager:
+    ports:
+      - "127.0.0.1:9093:9093"
+
+  rabbitmq:
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+
+  vault:
+    ports:
+      - "127.0.0.1:8200:8200"

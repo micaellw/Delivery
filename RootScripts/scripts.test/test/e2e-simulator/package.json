@@ -1,0 +1,19 @@
+{
+  "name": "e2e-simulator",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "gps:playback": "node auto-e2e-simulator.js",
+    "gps:manual": "node dev-gps-playback.js",
+    "test": "echo \"Use npm run gps:playback for automated E2E GPS simulation\" && exit 0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@microsoft/signalr": "^10.0.0",
+    "axios": "^1.16.1"
+  }
+}

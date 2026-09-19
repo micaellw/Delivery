@@ -1,0 +1,95 @@
+param(
+    [Parameter(Mandatory=$false)]
+    [string]$TunnelUrl
+)
+
+Write-Host "==================================================" -ForegroundColor Cyan
+Write-Host " Building Rider App APK for Real Road Test...     " -ForegroundColor Cyan
+Write-Host "==================================================" -ForegroundColor Cyan
+
+if ([string]::IsNullOrWhiteSpace($TunnelUrl)) {
+    $TunnelUrl = Read-Host "Enter Server Public URL (Optional, press Enter to configure in-app)"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($TunnelUrl)) {
+    $TunnelUrl = $TunnelUrl.TrimEnd('/')
+    if (-not ($TunnelUrl -match '^https?://')) {
+        Write-Host "`n[ERROR] Invalid Server Public URL: '$TunnelUrl'" -ForegroundColor Red
+        Write-Host "The URL must start with http:// or https:// (e.g. https://xxxx.trycloudflare.com)" -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "`nTarget Server Base URL (Pre-configured): $TunnelUrl" -ForegroundColor Yellow
+} else {
+    Write-Host "`nTarget Server Base URL: Configurable inside app via Server Settings" -ForegroundColor Yellow
+}
+
+# Auto-detect Flutter SDK path if not in current session PATH
+if (-not (Get-Command flutter -ErrorAction SilentlyContinue)) {
+    $KnownFlutterPaths = @(
+        "C:\src\flutter\bin",
+        "C:\flutter\bin",
+        "E:\flutter\bin",
+        "$env:LOCALAPPDATA\flutter\bin",
+        "$env:USERPROFILE\flutter\bin"
+    )
+    foreach ($path in $KnownFlutterPaths) {
+        if (Test-Path "$path\flutter.bat") {
+            Write-Host "[i] Auto-detected Flutter at: $path" -ForegroundColor DarkGray
+            $env:Path = "$path;$env:Path"
+            break
+        }
+    }
+}
+
+# Ensure Java 17 (LTS) is configured for Gradle compatibility
+$KnownJdkPaths = @(
+    "C:\Program Files\Microsoft\jdk-17.0.20.101-hotspot",
+    "C:\Program Files\Java\jdk-17",
+    "C:\Program Files\Eclipse Adoptium\jdk-17*"
+)
+foreach ($jdk in $KnownJdkPaths) {
+    $resolved = Resolve-Path $jdk -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($resolved -and (Test-Path "$($resolved.Path)\bin\java.exe")) {
+        $env:JAVA_HOME = $resolved.Path
+        $env:Path = "$($resolved.Path)\bin;$env:Path"
+        Write-Host "[i] Using JDK 17 at: $($resolved.Path)" -ForegroundColor DarkGray
+        break
+    }
+}
+
+$RiderAppDir = (Resolve-Path (Join-Path $PSScriptRoot "../../../../rider_app")).Path
+Push-Location $RiderAppDir
+
+try {
+    Write-Host "`n--> Fetching Flutter dependencies..." -ForegroundColor Cyan
+    flutter pub get
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ERROR] Failed to fetch Flutter packages." -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+
+    Write-Host "`n--> Compiling Android Release APK..." -ForegroundColor Cyan
+    if (-not [string]::IsNullOrWhiteSpace($TunnelUrl)) {
+        flutter build apk --release --android-skip-build-dependency-validation --dart-define=API_BASE_URL=$TunnelUrl
+    } else {
+        flutter build apk --release --android-skip-build-dependency-validation
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`n[ERROR] APK Build failed!" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+
+    $ApkPath = (Resolve-Path (Join-Path $RiderAppDir "build/app/outputs/flutter-apk/app-release.apk")).Path
+    Write-Host "`n==================================================" -ForegroundColor Green
+    Write-Host " [OK] APK Build Completed Successfully!" -ForegroundColor Green
+    Write-Host "==================================================" -ForegroundColor Green
+    Write-Host "APK Output Path:" -ForegroundColor White
+    Write-Host "   $ApkPath`n" -ForegroundColor Yellow
+    Write-Host "📲 Next Steps for Real Phone Testing:" -ForegroundColor White
+    Write-Host "   1. Send APK to the test phone (via USB, Drive, or LINE/Chat)" -ForegroundColor Gray
+    Write-Host "   2. Install and Grant 'Allow all the time' location permission" -ForegroundColor Gray
+    Write-Host "   3. Follow test cases in road-test/docs/03-gps-test.md`n" -ForegroundColor Gray
+}
+finally {
+    Pop-Location
+}

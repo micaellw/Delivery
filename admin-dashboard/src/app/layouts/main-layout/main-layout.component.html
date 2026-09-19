@@ -1,0 +1,97 @@
+<div class="shell">
+  <!-- Sidebar -->
+  <aside class="sidebar" [class.collapsed]="!isSidebarOpen">
+    <div class="brand">
+      <div class="brand-icon">
+        <lucide-icon [img]="navItems[1].icon" size="20"></lucide-icon>
+      </div>
+      @if (isSidebarOpen) {
+      <div class="brand-text">
+        <h1>Smart Delivery</h1>
+        <span>Routing System</span>
+      </div>
+      }
+    </div>
+
+    <div class="sidebar-content">
+      @if (isSidebarOpen) {
+      <span class="nav-label">Navigation</span>
+      }
+      <nav class="nav" aria-label="Main navigation">
+        @for (item of navItems; track item.path) {
+        <button type="button" [routerLink]="item.path" routerLinkActive="active" [title]="item.label">
+          <lucide-icon [img]="item.icon" size="18" [strokeWidth]="2"></lucide-icon>
+          @if (isSidebarOpen) {
+          <span class="nav-text">{{ item.label }}</span>
+          }
+        </button>
+        }
+      </nav>
+    </div>
+
+    <div class="sidebar-footer">
+      <button type="button" [title]="'Settings'">
+        <lucide-icon [img]="icons.Settings" size="18"></lucide-icon>
+        @if (isSidebarOpen) {
+        <span class="nav-text">Settings</span>
+        }
+      </button>
+      <button type="button" (click)="logout()" [title]="'Logout'">
+        <lucide-icon [img]="icons.User" size="18"></lucide-icon>
+        @if (isSidebarOpen) {
+        <span class="nav-text">Logout</span>
+        }
+      </button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="main-content">
+    <div class="technical-grid-bg technical-grid opacity-30"></div>
+
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <button class="icon-btn" (click)="toggleSidebar()">
+          <lucide-icon [img]="icons.Menu" size="18"></lucide-icon>
+        </button>
+        <div class="search-box">
+          <span class="search-command">COMMAND</span>
+          <span class="search-slash">/</span>
+          <div class="search-input-wrapper">
+            <lucide-icon [img]="icons.Search" size="14"></lucide-icon>
+            <input type="text" placeholder="search_payload_id..." />
+          </div>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <button class="icon-btn notification-btn">
+          <lucide-icon [img]="icons.Bell" size="18"></lucide-icon>
+          @if (toastService.history().length > 0) {
+            <span class="notification-badge">
+              {{ toastService.history().length > 99 ? '99+' : toastService.history().length }}
+            </span>
+          }
+        </button>
+        <div class="divider"></div>
+        <div class="profile-group">
+          <div class="profile-info">
+            <p class="profile-name">{{name}}</p>
+            <p class="profile-role">{{ authService.getUserRole()?.toUpperCase() ?? 'USER' }}</p>
+          </div>
+          <div class="profile-avatar">
+            <lucide-icon [img]="icons.User" size="16"></lucide-icon>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Workspace -->
+    <div class="workspace custom-scrollbar">
+      <router-outlet></router-outlet>
+    </div>
+  </main>
+
+  <app-toast></app-toast>
+</div>
