@@ -17,6 +17,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using System.Globalization;
+using StackExchange.Redis;
 
 namespace BackendApi.Features.FleetTracking.Telemetry
 {
@@ -121,6 +123,10 @@ namespace BackendApi.Features.FleetTracking.Telemetry
 
                 try
                 {
+                    var redisDb = _redis?.GetDatabase();
+                    var duplicatePoints = new List<TrackPoint>();
+                    var duplicateEventIds = new List<Guid>();
+
                     // Save to database within scoped context
                     using (var scope = _serviceProvider.CreateScope())
                     {
@@ -133,6 +139,7 @@ namespace BackendApi.Features.FleetTracking.Telemetry
                             try
                             {
                                 var newPoints = new List<TrackPoint>();
+                                var newEventIds = new List<Guid>();
                                 var processedEvents = new List<ProcessedEvent>();
 
                                 // Bulk Check ProcessedEvents for duplicates
@@ -142,22 +149,31 @@ namespace BackendApi.Features.FleetTracking.Telemetry
                                     .Select(pe => pe.EventId)
                                     .ToListAsync(ct);
 
+                                var existingEventSet = new HashSet<Guid>(existingEventIds);
                                 var uniqueEventIdsInBatch = new HashSet<Guid>();
                                 for (int i = 0; i < points.Count; i++)
                                 {
                                     var p = points[i];
                                     var eventId = eventIdsToCheck[i];
                                     
-                                    // Check DB existing AND current batch existing to prevent EF Tracking Exception
-                                    if (!existingEventIds.Contains(eventId) && uniqueEventIdsInBatch.Add(eventId))
+                                    if (!existingEventSet.Contains(eventId))
                                     {
-                                        newPoints.Add(p);
-                                        processedEvents.Add(new ProcessedEvent
+                                        if (uniqueEventIdsInBatch.Add(eventId))
                                         {
-                                            EventId = eventId,
-                                            HandlerName = "GpsConsumer",
-                                            ProcessedAt = DateTime.UtcNow
-                                        });
+                                            newPoints.Add(p);
+                                            newEventIds.Add(eventId);
+                                            processedEvents.Add(new ProcessedEvent
+                                            {
+                                                EventId = eventId,
+                                                HandlerName = "GpsConsumer",
+                                                ProcessedAt = DateTime.UtcNow
+                                            });
+                                        }
+                                    }
+                                    else
+                                    {
+                                        duplicatePoints.Add(p);
+                                        duplicateEventIds.Add(eventId);
                                     }
                                 }
 
@@ -167,12 +183,18 @@ namespace BackendApi.Features.FleetTracking.Telemetry
                                     dbContext.ProcessedEvents.AddRange(processedEvents);
                                     await dbContext.SaveChangesAsync(ct);
 
-                                    // Save new unique GPS points
+                                    // Save new unique GPS points to PostgreSQL
                                     await historyService.SavePointsAsync(newPoints, ct);
+
+                                    // Dual-write to Redis Stream before committing DB transaction
+                                    if (redisDb != null)
+                                    {
+                                        await WriteToRedisStreamAsync(redisDb, newPoints, newEventIds);
+                                    }
                                 }
 
                                 await transaction.CommitAsync(ct);
-                                _logger.LogInformation("Successfully saved batch of {Count} GPS points (New unique: {UniqueCount}) within atomic transaction.", points.Count, newPoints.Count);
+                                _logger.LogInformation("Successfully committed batch of {Count} GPS points (New unique: {UniqueCount}) to PostgreSQL.", points.Count, newPoints.Count);
                             }
                             catch (Exception)
                             {
@@ -182,7 +204,36 @@ namespace BackendApi.Features.FleetTracking.Telemetry
                         }
                     }
 
-                    // Successful Database Save -> Bulk ACK to RabbitMQ
+                    // Process duplicate points: Case 5 Redelivery repair guard
+                    if (redisDb != null && duplicatePoints.Count > 0)
+                    {
+                        var repairPoints = new List<TrackPoint>();
+                        var repairEventIds = new List<Guid>();
+
+                        var checkTasks = duplicateEventIds.Select(id => redisDb.KeyExistsAsync(StreamSeenPrefix + id.ToString("D"))).ToArray();
+                        await Task.WhenAll(checkTasks);
+
+                        for (int i = 0; i < checkTasks.Length; i++)
+                        {
+                            if (!checkTasks[i].Result)
+                            {
+                                repairPoints.Add(duplicatePoints[i]);
+                                repairEventIds.Add(duplicateEventIds[i]);
+                            }
+                        }
+
+                        if (repairPoints.Count > 0)
+                        {
+                            _logger.LogWarning("Detected {Count} redelivered GPS points missing from Redis Stream. Repairing stream pipeline...", repairPoints.Count);
+                            await WriteToRedisStreamAsync(redisDb, repairPoints, repairEventIds);
+                        }
+                        else
+                        {
+                            _logger.LogDebug("All {Count} redelivered GPS points already exist in Redis Stream guard. Skipping duplicate XADD.", duplicatePoints.Count);
+                        }
+                    }
+
+                    // Successful Database Save & Dual-Write -> Bulk ACK to RabbitMQ
                     ulong maxDeliveryTag = 0;
                     foreach (var tag in deliveryTags)
                     {
@@ -200,7 +251,7 @@ namespace BackendApi.Features.FleetTracking.Telemetry
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to commit batch of {Count} GPS points to the database. Messages will be NACKed to DLQ.", points.Count);
+                    _logger.LogError(ex, "Failed to commit batch of {Count} GPS points to the database / Redis stream. Messages will be NACKed to DLQ.", points.Count);
                     
                     ulong maxDeliveryTag = 0;
                     foreach (var tag in deliveryTags)
@@ -221,5 +272,37 @@ namespace BackendApi.Features.FleetTracking.Telemetry
             }
         }
 
+        /// <summary>
+        /// Writes GPS points to Redis Stream with approximate trimming (MAXLEN ~ 100,000)
+        /// and records short-lived duplicate storm guard keys (TTL: 1 hour).
+        /// </summary>
+        private static async Task WriteToRedisStreamAsync(IDatabase redisDb, List<TrackPoint> points, List<Guid> eventIds)
+        {
+            var tasks = new List<Task>(points.Count * 2);
+
+            for (int i = 0; i < points.Count; i++)
+            {
+                var p = points[i];
+                var eventId = eventIds[i];
+                var eventIdStr = eventId.ToString("D");
+
+                var entries = new NameValueEntry[]
+                {
+                    new("eventId", eventIdStr),
+                    new("riderId", p.RiderId),
+                    new("timestamp", p.Timestamp.ToUniversalTime().ToString("o")),
+                    new("lat", p.Lat.ToString("G17", CultureInfo.InvariantCulture)),
+                    new("lng", p.Lng.ToString("G17", CultureInfo.InvariantCulture)),
+                    new("accuracy", "0.0")
+                };
+
+                // Approximate trimming MAXLEN ~ 100000 (Memory Bounding Policy)
+                tasks.Add(redisDb.StreamAddAsync(StreamKey, entries, maxLength: StreamMaxLen, useApproximateMaxLength: true));
+                // Short-lived duplicate storm guard (TTL: 1 hour)
+                tasks.Add(redisDb.StringSetAsync(StreamSeenPrefix + eventIdStr, "1", StreamSeenTtl));
+            }
+
+            await Task.WhenAll(tasks);
+        }
     }
 }

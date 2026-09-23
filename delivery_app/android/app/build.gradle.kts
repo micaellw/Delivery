@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.ninemek.delivery"
+    namespace = "com.smart.delivery"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = "30.0.16138531"
 
@@ -19,9 +19,19 @@ android {
         jvmTarget = JavaVersion.VERSION_11.toString()
     }
 
+        val whitelabelAppId = System.getenv("APPLICATION_ID")
+    val defaultAppId = "com.smart.delivery"
+    val finalAppId = if (whitelabelAppId != null && whitelabelAppId.isNotBlank()) whitelabelAppId else defaultAppId
+
+    val whitelabelAppName = System.getenv("WHITELABEL_APP_NAME")
+        ?: (if (System.getenv("APP_NAME") != null && System.getenv("APP_NAME") != "Gradle") System.getenv("APP_NAME") else null)
+    val defaultAppName = "Smart Delivery"
+    val finalAppName = if (whitelabelAppName != null && whitelabelAppName.isNotBlank()) whitelabelAppName else defaultAppName
+
     defaultConfig {
         // Unique Application ID
-        applicationId = "com.ninemek.delivery"
+        applicationId = finalAppId
+        resValue("string", "app_name", finalAppName)
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
@@ -45,4 +55,5 @@ android {
 flutter {
     source = "../.."
 }
+
 

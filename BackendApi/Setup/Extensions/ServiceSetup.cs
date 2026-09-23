@@ -134,6 +134,11 @@ public static class ServiceSetup
         services.AddHttpClient();
         services.AddScoped<BackendApi.Services.Notifications.IFcmNotificationService, BackendApi.Services.Notifications.FcmNotificationService>();
 
+        // --- Storage Services ---
+        services.AddSingleton<BackendApi.Services.Storage.IStorageService, BackendApi.Services.Storage.MinioStorageService>();
+        services.AddSingleton<BackendApi.Services.Storage.ITelemetryArchiveStorage, BackendApi.Services.Storage.MinioTelemetryArchiveStorage>();
+        services.AddHostedService<BackendApi.Services.Storage.MinioBucketInitializerHostedService>();
+
         // --- EventBus / RabbitMQ Message Broker ---
         services.AddSingleton<IEventBus, RabbitMqEventBus>();
         services.AddTransient<OrderCreatedIntegrationEventHandler>();
@@ -148,6 +153,7 @@ public static class ServiceSetup
         services.AddHostedService<PartitionMaintenanceWorker>();
         services.AddHostedService<TelemetryBroadcastWorker>();
         services.AddHostedService<OsrmSnapWorker>();
+        services.AddHostedService<TelemetryArchiveWorker>();
         services.AddHostedService<DispatchBackgroundWorker>();
         services.AddHostedService<QueuedHostedService>();
         services.AddHostedService<DbMaintenanceWorker>();

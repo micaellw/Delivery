@@ -1,40 +1,22 @@
-# =============================================================================
-# Build Android APK via Flutter Docker Container (No local Flutter/Java required)
-# =============================================================================
 param(
-    [string]$TunnelUrl = ""
+    [Parameter(Mandatory=$true)][string]$AppName,
+    [Parameter(Mandatory=$true)][string]$ApplicationId,
+    [Parameter(Mandatory=$true)][string]$ApiBaseUrl
 )
-
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $appDir = Resolve-Path (Join-Path $scriptDir "..")
 
-Write-Host "==================================================" -ForegroundColor Cyan
-Write-Host " Building Delivery App Release APK via Docker...  " -ForegroundColor Cyan
-Write-Host "==================================================" -ForegroundColor Cyan
+Write-Host "APP_NAME: $AppName" -ForegroundColor Yellow
+Write-Host "APPLICATION_ID: $ApplicationId" -ForegroundColor Yellow
+Write-Host "API_BASE_URL: $ApiBaseUrl" -ForegroundColor Yellow
 
-$apiFlag = ""
-if ($TunnelUrl) {
-    $apiFlag = "--dart-define=API_BASE_URL=$TunnelUrl"
-    Write-Host "Pre-configuring Server Base URL: $TunnelUrl" -ForegroundColor Yellow
-} else {
-    Write-Host "Server URL will be configurable inside app (Settings > Server URL)" -ForegroundColor Yellow
-}
-
-$buildCmd = "flutter pub get && flutter build apk --release --android-skip-build-dependency-validation $apiFlag"
-
-Write-Host "`n--> Compiling Android Release APK inside Docker container..." -ForegroundColor Cyan
-docker run --rm -v "${appDir}:/app" -w /app ghcr.io/cirruslabs/flutter:stable bash -c "$buildCmd"
+docker run --rm -e "WHITELABEL_APP_NAME=$AppName" -e "APP_NAME=$AppName" -e "APPLICATION_ID=$ApplicationId" -e "API_BASE_URL=$ApiBaseUrl" -v "${appDir}:/app" -w /app ghcr.io/cirruslabs/flutter:stable bash scripts/build-inside-docker.sh
 
 if ($LASTEXITCODE -eq 0) {
     $apkPath = Join-Path $appDir "build\app\outputs\flutter-apk\app-release.apk"
     if (Test-Path $apkPath) {
-        Write-Host "`n==================================================" -ForegroundColor Green
-        Write-Host " [OK] Android Release APK Built Successfully!" -ForegroundColor Green
-        Write-Host "==================================================" -ForegroundColor Green
-        Copy-Item $apkPath -Destination (Join-Path $scriptDir "..\apk\delivery-app.apk") -Force`n        Write-Host "Output File: ..\apk\delivery-app.apk" -ForegroundColor White
+        Copy-Item $apkPath -Destination (Join-Path $scriptDir "..\apk\delivery-app.apk") -Force
+        Write-Host "Output File: ..\apk\delivery-app.apk" -ForegroundColor White
     }
-} else {
-    Write-Host "`n[ERROR] APK build failed with code $LASTEXITCODE" -ForegroundColor Red
-}
-
+} else { exit $LASTEXITCODE }
 

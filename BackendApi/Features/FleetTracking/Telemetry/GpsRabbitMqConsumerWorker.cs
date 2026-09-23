@@ -17,6 +17,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using StackExchange.Redis;
 
 namespace BackendApi.Features.FleetTracking.Telemetry
 {
@@ -30,10 +31,18 @@ namespace BackendApi.Features.FleetTracking.Telemetry
     {
         private const string QueueName = "gps_telemetry_queue";
         private const int SubBatchLimit = 5_000;
+
+        // Phase 2: Telemetry Stream Constants
+        public const string StreamKey = "telemetry:stream:gps";
+        public const int StreamMaxLen = 100_000;
+        public const string StreamSeenPrefix = "telemetry:stream:seen:";
+        public static readonly TimeSpan StreamSeenTtl = TimeSpan.FromHours(1);
+
         private readonly IServiceProvider _serviceProvider;
         private readonly IConfiguration _configuration;
         private readonly IHostApplicationLifetime _appLifetime;
         private readonly ILogger<GpsRabbitMqConsumerWorker> _logger;
+        protected readonly IConnectionMultiplexer? _redis;
 
         private IConnection? _connection;
         private IModel? _channel;
@@ -46,12 +55,14 @@ namespace BackendApi.Features.FleetTracking.Telemetry
             IServiceProvider serviceProvider,
             IConfiguration configuration,
             IHostApplicationLifetime appLifetime,
-            ILogger<GpsRabbitMqConsumerWorker> logger)
+            ILogger<GpsRabbitMqConsumerWorker> logger,
+            IConnectionMultiplexer? redis = null)
         {
             _serviceProvider = serviceProvider;
             _configuration = configuration;
             _appLifetime = appLifetime;
             _logger = logger;
+            _redis = redis ?? serviceProvider.GetService<IConnectionMultiplexer>();
 
             // Bounded to 10,000 items in C# memory to prevent OOM
             _localChannel = Channel.CreateBounded<(TrackPoint, ulong)>(new BoundedChannelOptions(10_000)

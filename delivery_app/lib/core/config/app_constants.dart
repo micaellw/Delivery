@@ -1,26 +1,26 @@
-ï»¿/// App-wide constants for the Rider App.
+/// App-wide constants for the Rider App.
 ///
-/// à¹€à¸—à¸µà¸¢à¸šà¸à¸±à¸š:
+/// à·ÕÂº¡Ñº:
 /// - .NET: `BackendApi/Security/AuthConstants.cs`
 class AppConstants {
   AppConstants._();
 
-  // â”€â”€ App Info â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  static const String appName = 'Rider App';
+  // ÄÄ App Info ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+  static const String appName = String.fromEnvironment('APP_NAME', defaultValue: 'Smart Delivery');
   static const String appVersion = '1.0.0';
 
-  // â”€â”€ Storage Keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  /// Key à¸ªà¸³à¸«à¸£à¸±à¸šà¹€à¸à¹‡à¸š JWT access token à¹ƒà¸™ SecureStorage
+  // ÄÄ Storage Keys ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+  /// Key ÊÓËÃÑºà¡çº JWT access token ã¹ SecureStorage
   static const String accessTokenKey = 'delivery_access_token';
 
-  /// Key à¸ªà¸³à¸«à¸£à¸±à¸šà¹€à¸à¹‡à¸š refresh token (à¸–à¹‰à¸²à¸¡à¸µà¹ƒà¸™à¸­à¸™à¸²à¸„à¸•)
+  /// Key ÊÓËÃÑºà¡çº refresh token (¶éÒÁÕã¹Í¹Ò¤µ)
   static const String refreshTokenKey = 'delivery_refresh_token';
 
-  /// Key à¸ªà¸³à¸«à¸£à¸±à¸šà¹€à¸à¹‡à¸š user data
+  /// Key ÊÓËÃÑºà¡çº user data
   static const String userDataKey = 'delivery_user_data';
 
-  // â”€â”€ Rider Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  /// à¸•à¸£à¸‡à¸à¸±à¸š Rider.Status à¹ƒà¸™ BackendApi/Models/Entities/Rider.cs
+  // ÄÄ Rider Status ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+  /// µÃ§¡Ñº Rider.Status ã¹ BackendApi/Models/Entities/Rider.cs
   static const String statusAvailable = 'IDLE';
   static const String statusReserved = 'RESERVED';
   static const String statusBusy = 'BUSY';
@@ -28,17 +28,18 @@ class AppConstants {
   static const String statusOffline = 'OFFLINE';
   static const int riderHeartbeatIntervalSeconds = 10;
 
-  // â”€â”€ Order Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  /// à¸•à¸£à¸‡à¸à¸±à¸š Order.Status à¹ƒà¸™ BackendApi/Models/Entities/Order.cs
+  // ÄÄ Order Status ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+  /// µÃ§¡Ñº Order.Status ã¹ BackendApi/Models/Entities/Order.cs
   static const String orderAssigned = 'ASSIGNED';
   static const String orderDelivering = 'DELIVERING';
   static const String orderCompleted = 'COMPLETED';
   static const String orderCancelled = 'CANCELLED';
 
-  // â”€â”€ API Endpoints (relative to baseUrl /api/v1 â€” à¸«à¹‰à¸²à¸¡à¸‚à¸¶à¹‰à¸™à¸•à¹‰à¸™à¸”à¹‰à¸§à¸¢ /) â”€â”€
-  /// Dio à¸£à¸§à¸¡ path à¸à¸±à¸š baseUrl; path à¸—à¸µà¹ˆà¸‚à¸¶à¹‰à¸™à¸•à¹‰à¸™à¸”à¹‰à¸§à¸¢ / à¸ˆà¸°à¸«à¸¥à¸¸à¸”à¸­à¸­à¸à¸ˆà¸²à¸ /api/v1
+  // ÄÄ API Endpoints (relative to baseUrl /api/v1 — ËéÒÁ¢Öé¹µé¹´éÇÂ /) ÄÄ
+  /// Dio ÃÇÁ path ¡Ñº baseUrl; path ·Õè¢Öé¹µé¹´éÇÂ / ¨ĞËÅØ´ÍÍ¡¨Ò¡ /api/v1
   static const String ridersEndpoint = 'riders';
   static const String ordersEndpoint = 'orders';
   static const String authEndpoint = 'auth';
 }
+
 

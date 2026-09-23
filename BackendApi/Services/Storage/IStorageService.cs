@@ -10,5 +10,6 @@ namespace BackendApi.Services.Storage
         Task<string> UploadBase64Async(string base64Data, string folder = "items", CancellationToken ct = default);
         Task<bool> DeleteAsync(string objectName, CancellationToken ct = default);
         string GetPublicUrl(string objectName);
+        Task EnsureBucketExistsAsync(CancellationToken ct = default);
     }
 }

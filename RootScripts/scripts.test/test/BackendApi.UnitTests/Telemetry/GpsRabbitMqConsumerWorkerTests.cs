@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -14,6 +15,7 @@ using Microsoft.Extensions.Hosting;
 using Moq;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using StackExchange.Redis;
 using Xunit;
 using BackendApi.Data;
 using BackendApi.Models;
@@ -297,6 +299,412 @@ namespace BackendApi.UnitTests.Telemetry
             ), Times.Never);
         }
 
+        [Fact]
+        public async Task Worker_DualWrite_BothSucceed_WritesBothSinksAndAcksRabbitMq()
+        {
+            // Arrange
+            AsyncEventingBasicConsumer? capturedConsumer = null;
+            _channelMock.Setup(c => c.BasicConsume(
+                It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<bool>(), It.IsAny<IDictionary<string, object>?>(), It.IsAny<IBasicConsumer>()
+            )).Callback((string q, bool a, string t, bool nl, bool ex, IDictionary<string, object>? args, IBasicConsumer c) =>
+            {
+                capturedConsumer = c as AsyncEventingBasicConsumer;
+            }).Returns("consumer_tag");
+
+            var mockRedis = new Mock<IConnectionMultiplexer>();
+            var mockRedisDb = new Mock<StackExchange.Redis.IDatabase>();
+            mockRedis.SetReturnsDefault<StackExchange.Redis.IDatabase>(mockRedisDb.Object);
+            mockRedis.Setup(r => r.GetDatabase(It.IsAny<int>(), It.IsAny<object?>())).Returns(mockRedisDb.Object);
+
+            mockRedisDb.SetReturnsDefault<Task<RedisValue>>(Task.FromResult((RedisValue)"1-0"));
+            mockRedisDb.SetReturnsDefault<Task<bool>>(Task.FromResult(true));
+
+            var ackTriggered = new TaskCompletionSource<bool>();
+            _channelMock.Setup(c => c.BasicAck(It.IsAny<ulong>(), It.IsAny<bool>()))
+                .Callback((ulong tag, bool multiple) => ackTriggered.TrySetResult(true));
+
+            var worker = new TestableGpsRabbitMqConsumerWorker(
+                _serviceProviderMock.Object, _configMock.Object, _appLifetimeMock.Object,
+                _loggerMock.Object, _connectionMock.Object, mockRedis.Object
+            );
+
+            using var cts = new CancellationTokenSource();
+            var runTask = worker.StartAsync(cts.Token);
+
+            int retries = 0;
+            while (capturedConsumer == null && retries < 20)
+            {
+                await Task.Delay(50);
+                retries++;
+            }
+            Assert.NotNull(capturedConsumer);
+
+            var point = new TrackPoint("rider_dual_1", 13.75, 100.5, DateTime.UtcNow);
+            var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(point));
+            ulong deliveryTag = 101;
+
+            await capturedConsumer.HandleBasicDeliver(
+                "consumer_tag", deliveryTag, false, "", "gps_telemetry_queue",
+                _channelMock.Object.CreateBasicProperties(), body
+            );
+
+            var acked = await Task.WhenAny(ackTriggered.Task, Task.Delay(5000)) == ackTriggered.Task;
+            Assert.True(acked, "RabbitMQ BasicAck was not triggered.");
+
+            await cts.CancelAsync();
+            await runTask;
+
+            // Assert: DB save executed
+            _gpsHistoryServiceMock.Verify(g => g.SavePointsAsync(It.IsAny<List<TrackPoint>>(), It.IsAny<CancellationToken>()), Times.Once);
+            // Assert: Redis StreamAdd executed
+            mockRedisDb.Verify(d => d.StreamAddAsync(
+                It.Is<RedisKey>(k => k == GpsRabbitMqConsumerWorker.StreamKey),
+                It.IsAny<NameValueEntry[]>(),
+                It.IsAny<RedisValue?>(),
+                It.Is<long?>(l => l == GpsRabbitMqConsumerWorker.StreamMaxLen),
+                true,
+                It.IsAny<long?>(),
+                It.IsAny<StreamTrimMode>(),
+                It.IsAny<CommandFlags>()
+            ), Times.Once);
+            // Assert: RabbitMQ ACKed with multiple: true
+            _channelMock.Verify(c => c.BasicAck(deliveryTag, true), Times.Once);
+            _channelMock.Verify(c => c.BasicNack(It.IsAny<ulong>(), It.IsAny<bool>(), It.IsAny<bool>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task Worker_DualWrite_RedisFails_RollsBackDbAndNacks()
+        {
+            // Arrange
+            AsyncEventingBasicConsumer? capturedConsumer = null;
+            _channelMock.Setup(c => c.BasicConsume(
+                It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<bool>(), It.IsAny<IDictionary<string, object>?>(), It.IsAny<IBasicConsumer>()
+            )).Callback((string q, bool a, string t, bool nl, bool ex, IDictionary<string, object>? args, IBasicConsumer c) =>
+            {
+                capturedConsumer = c as AsyncEventingBasicConsumer;
+            }).Returns("consumer_tag");
+
+            var mockRedis = new Mock<IConnectionMultiplexer>();
+            var mockRedisDb = new Mock<StackExchange.Redis.IDatabase>();
+            mockRedis.SetReturnsDefault<StackExchange.Redis.IDatabase>(mockRedisDb.Object);
+            mockRedis.Setup(r => r.GetDatabase(It.IsAny<int>(), It.IsAny<object?>())).Returns(mockRedisDb.Object);
+            mockRedisDb.SetReturnsDefault<Task<bool>>(Task.FromResult(true));
+
+            mockRedisDb.Setup(d => d.StreamAddAsync(
+                It.IsAny<RedisKey>(),
+                It.IsAny<NameValueEntry[]>(),
+                It.IsAny<RedisValue?>(),
+                It.IsAny<long?>(),
+                It.IsAny<bool>(),
+                It.IsAny<long?>(),
+                It.IsAny<StreamTrimMode>(),
+                It.IsAny<CommandFlags>()
+            )).ThrowsAsync(new RedisConnectionException(ConnectionFailureType.UnableToConnect, "Redis connection failed!"));
+
+            var nackTriggered = new TaskCompletionSource<bool>();
+            _channelMock.Setup(c => c.BasicNack(It.IsAny<ulong>(), It.IsAny<bool>(), It.IsAny<bool>()))
+                .Callback((ulong tag, bool multiple, bool requeue) => nackTriggered.TrySetResult(true));
+
+            var worker = new TestableGpsRabbitMqConsumerWorker(
+                _serviceProviderMock.Object, _configMock.Object, _appLifetimeMock.Object,
+                _loggerMock.Object, _connectionMock.Object, mockRedis.Object
+            );
+
+            using var cts = new CancellationTokenSource();
+            var runTask = worker.StartAsync(cts.Token);
+
+            int retries = 0;
+            while (capturedConsumer == null && retries < 20)
+            {
+                await Task.Delay(50);
+                retries++;
+            }
+            Assert.NotNull(capturedConsumer);
+
+            var point = new TrackPoint("rider_fail_redis", 13.80, 100.6, DateTime.UtcNow);
+            var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(point));
+            ulong deliveryTag = 202;
+
+            await capturedConsumer.HandleBasicDeliver(
+                "consumer_tag", deliveryTag, false, "", "gps_telemetry_queue",
+                _channelMock.Object.CreateBasicProperties(), body
+            );
+
+            var nacked = await Task.WhenAny(nackTriggered.Task, Task.Delay(5000)) == nackTriggered.Task;
+            Assert.True(nacked, "BasicNack was not triggered.");
+
+            await cts.CancelAsync();
+            await runTask;
+
+            // Assert: DB transaction rolled back
+            _dbTransactionMock.Verify(t => t.RollbackAsync(It.IsAny<CancellationToken>()), Times.Once);
+            // Assert: RabbitMQ NACKed with multiple: true, requeue: false (DLQ)
+            _channelMock.Verify(c => c.BasicNack(deliveryTag, true, false), Times.Once);
+            _channelMock.Verify(c => c.BasicAck(It.IsAny<ulong>(), It.IsAny<bool>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task Worker_DualWrite_DbDuplicate_SeenExists_SkipsStreamWriteAndAcks()
+        {
+            // Arrange
+            AsyncEventingBasicConsumer? capturedConsumer = null;
+            _channelMock.Setup(c => c.BasicConsume(
+                It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<bool>(), It.IsAny<IDictionary<string, object>?>(), It.IsAny<IBasicConsumer>()
+            )).Callback((string q, bool a, string t, bool nl, bool ex, IDictionary<string, object>? args, IBasicConsumer c) =>
+            {
+                capturedConsumer = c as AsyncEventingBasicConsumer;
+            }).Returns("consumer_tag");
+
+            var mockRedis = new Mock<IConnectionMultiplexer>();
+            var mockRedisDb = new Mock<StackExchange.Redis.IDatabase>();
+            mockRedis.SetReturnsDefault<StackExchange.Redis.IDatabase>(mockRedisDb.Object);
+            mockRedis.Setup(r => r.GetDatabase(It.IsAny<int>(), It.IsAny<object?>())).Returns(mockRedisDb.Object);
+            mockRedisDb.SetReturnsDefault<Task<bool>>(Task.FromResult(true)); // Seen key exists!
+
+            var ackTriggered = new TaskCompletionSource<bool>();
+            _channelMock.Setup(c => c.BasicAck(It.IsAny<ulong>(), It.IsAny<bool>()))
+                .Callback((ulong tag, bool multiple) => ackTriggered.TrySetResult(true));
+
+            var worker = new TestableGpsRabbitMqConsumerWorker(
+                _serviceProviderMock.Object, _configMock.Object, _appLifetimeMock.Object,
+                _loggerMock.Object, _connectionMock.Object, mockRedis.Object
+            );
+
+            // Pre-seed ProcessedEvents in DbContext to simulate DB duplicate
+            var point = new TrackPoint("rider_dup_seen", 13.85, 100.7, new DateTime(2026, 9, 20, 12, 0, 0, DateTimeKind.Utc));
+            string key = $"{point.RiderId}_{point.Timestamp.Ticks}";
+            byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(key));
+            var existingEventId = new Guid(hash.AsSpan(0, 16));
+
+            _dbContextMock.Object.ProcessedEvents.Add(new ProcessedEvent
+            {
+                EventId = existingEventId,
+                HandlerName = "GpsConsumer",
+                ProcessedAt = DateTime.UtcNow.AddMinutes(-5)
+            });
+            await _dbContextMock.Object.SaveChangesAsync();
+
+            using var cts = new CancellationTokenSource();
+            var runTask = worker.StartAsync(cts.Token);
+
+            int retries = 0;
+            while (capturedConsumer == null && retries < 20)
+            {
+                await Task.Delay(50);
+                retries++;
+            }
+            Assert.NotNull(capturedConsumer);
+
+            var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(point));
+            ulong deliveryTag = 303;
+
+            await capturedConsumer.HandleBasicDeliver(
+                "consumer_tag", deliveryTag, true, "", "gps_telemetry_queue",
+                _channelMock.Object.CreateBasicProperties(), body
+            );
+
+            var acked = await Task.WhenAny(ackTriggered.Task, Task.Delay(5000)) == ackTriggered.Task;
+            Assert.True(acked, "RabbitMQ BasicAck was not triggered.");
+
+            await cts.CancelAsync();
+            await runTask;
+
+            // Verify: DB save skipped, Redis StreamAdd skipped, and RabbitMQ ACKed
+            _gpsHistoryServiceMock.Verify(g => g.SavePointsAsync(It.IsAny<List<TrackPoint>>(), It.IsAny<CancellationToken>()), Times.Never);
+            mockRedisDb.Verify(d => d.StreamAddAsync(
+                It.IsAny<RedisKey>(),
+                It.IsAny<NameValueEntry[]>(),
+                It.IsAny<RedisValue?>(),
+                It.IsAny<long?>(),
+                It.IsAny<bool>(),
+                It.IsAny<long?>(),
+                It.IsAny<StreamTrimMode>(),
+                It.IsAny<CommandFlags>()
+            ), Times.Never);
+            _channelMock.Verify(c => c.BasicAck(deliveryTag, true), Times.Once);
+            _channelMock.Verify(c => c.BasicNack(It.IsAny<ulong>(), It.IsAny<bool>(), It.IsAny<bool>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task Worker_DualWrite_DbDuplicate_SeenMissing_RepairsStreamAndAcks()
+        {
+            // Arrange
+            AsyncEventingBasicConsumer? capturedConsumer = null;
+            _channelMock.Setup(c => c.BasicConsume(
+                It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<bool>(), It.IsAny<IDictionary<string, object>?>(), It.IsAny<IBasicConsumer>()
+            )).Callback((string q, bool a, string t, bool nl, bool ex, IDictionary<string, object>? args, IBasicConsumer c) =>
+            {
+                capturedConsumer = c as AsyncEventingBasicConsumer;
+            }).Returns("consumer_tag");
+
+            var mockRedis = new Mock<IConnectionMultiplexer>();
+            var mockRedisDb = new Mock<StackExchange.Redis.IDatabase>();
+            mockRedis.SetReturnsDefault<StackExchange.Redis.IDatabase>(mockRedisDb.Object);
+            mockRedis.Setup(r => r.GetDatabase(It.IsAny<int>(), It.IsAny<object?>())).Returns(mockRedisDb.Object);
+            mockRedisDb.SetReturnsDefault<Task<RedisValue>>(Task.FromResult((RedisValue)"2-0"));
+            mockRedisDb.SetReturnsDefault<Task<bool>>(Task.FromResult(true));
+
+            mockRedisDb.Setup(d => d.KeyExistsAsync(
+                It.IsAny<RedisKey>(),
+                It.IsAny<CommandFlags>()
+            )).ReturnsAsync(false); // Seen key missing -> requires repair!
+
+            var ackTriggered = new TaskCompletionSource<bool>();
+            _channelMock.Setup(c => c.BasicAck(It.IsAny<ulong>(), It.IsAny<bool>()))
+                .Callback((ulong tag, bool multiple) => ackTriggered.TrySetResult(true));
+
+            var worker = new TestableGpsRabbitMqConsumerWorker(
+                _serviceProviderMock.Object, _configMock.Object, _appLifetimeMock.Object,
+                _loggerMock.Object, _connectionMock.Object, mockRedis.Object
+            );
+
+            // Pre-seed ProcessedEvents in DbContext to simulate DB duplicate
+            var point = new TrackPoint("rider_dup_missing", 13.90, 100.8, new DateTime(2026, 9, 20, 13, 0, 0, DateTimeKind.Utc));
+            string key = $"{point.RiderId}_{point.Timestamp.Ticks}";
+            byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(key));
+            var existingEventId = new Guid(hash.AsSpan(0, 16));
+
+            _dbContextMock.Object.ProcessedEvents.Add(new ProcessedEvent
+            {
+                EventId = existingEventId,
+                HandlerName = "GpsConsumer",
+                ProcessedAt = DateTime.UtcNow.AddMinutes(-5)
+            });
+            await _dbContextMock.Object.SaveChangesAsync();
+
+            using var cts = new CancellationTokenSource();
+            var runTask = worker.StartAsync(cts.Token);
+
+            int retries = 0;
+            while (capturedConsumer == null && retries < 20)
+            {
+                await Task.Delay(50);
+                retries++;
+            }
+            Assert.NotNull(capturedConsumer);
+
+            var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(point));
+            ulong deliveryTag = 404;
+
+            await capturedConsumer.HandleBasicDeliver(
+                "consumer_tag", deliveryTag, true, "", "gps_telemetry_queue",
+                _channelMock.Object.CreateBasicProperties(), body
+            );
+
+            var acked = await Task.WhenAny(ackTriggered.Task, Task.Delay(5000)) == ackTriggered.Task;
+            Assert.True(acked, "RabbitMQ BasicAck was not triggered.");
+
+            await cts.CancelAsync();
+            await runTask;
+
+            // Verify: DB save skipped, Redis StreamAdd executed for repair, and RabbitMQ ACKed
+            _gpsHistoryServiceMock.Verify(g => g.SavePointsAsync(It.IsAny<List<TrackPoint>>(), It.IsAny<CancellationToken>()), Times.Never);
+            mockRedisDb.Verify(d => d.StreamAddAsync(
+                It.Is<RedisKey>(k => k == GpsRabbitMqConsumerWorker.StreamKey),
+                It.IsAny<NameValueEntry[]>(),
+                It.IsAny<RedisValue?>(),
+                It.Is<long?>(l => l == GpsRabbitMqConsumerWorker.StreamMaxLen),
+                true,
+                It.IsAny<long?>(),
+                It.IsAny<StreamTrimMode>(),
+                It.IsAny<CommandFlags>()
+            ), Times.Once);
+            _channelMock.Verify(c => c.BasicAck(deliveryTag, true), Times.Once);
+            _channelMock.Verify(c => c.BasicNack(It.IsAny<ulong>(), It.IsAny<bool>(), It.IsAny<bool>()), Times.Never);
+        }
+
+        [Fact]
+        public async Task Worker_DualWrite_DbDuplicate_RepairRedisFails_Nacks()
+        {
+            // Arrange
+            AsyncEventingBasicConsumer? capturedConsumer = null;
+            _channelMock.Setup(c => c.BasicConsume(
+                It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<bool>(), It.IsAny<IDictionary<string, object>?>(), It.IsAny<IBasicConsumer>()
+            )).Callback((string q, bool a, string t, bool nl, bool ex, IDictionary<string, object>? args, IBasicConsumer c) =>
+            {
+                capturedConsumer = c as AsyncEventingBasicConsumer;
+            }).Returns("consumer_tag");
+
+            var mockRedis = new Mock<IConnectionMultiplexer>();
+            var mockRedisDb = new Mock<StackExchange.Redis.IDatabase>();
+            mockRedis.SetReturnsDefault<StackExchange.Redis.IDatabase>(mockRedisDb.Object);
+            mockRedis.Setup(r => r.GetDatabase(It.IsAny<int>(), It.IsAny<object?>())).Returns(mockRedisDb.Object);
+            mockRedisDb.SetReturnsDefault<Task<bool>>(Task.FromResult(true));
+
+            mockRedisDb.Setup(d => d.KeyExistsAsync(
+                It.IsAny<RedisKey>(),
+                It.IsAny<CommandFlags>()
+            )).ReturnsAsync(false); // Seen missing -> tries repair
+
+            mockRedisDb.Setup(d => d.StreamAddAsync(
+                It.IsAny<RedisKey>(),
+                It.IsAny<NameValueEntry[]>(),
+                It.IsAny<RedisValue?>(),
+                It.IsAny<long?>(),
+                It.IsAny<bool>(),
+                It.IsAny<long?>(),
+                It.IsAny<StreamTrimMode>(),
+                It.IsAny<CommandFlags>()
+            )).ThrowsAsync(new RedisTimeoutException("Redis timed out during repair!", CommandStatus.WaitingToBeSent));
+
+            var nackTriggered = new TaskCompletionSource<bool>();
+            _channelMock.Setup(c => c.BasicNack(It.IsAny<ulong>(), It.IsAny<bool>(), It.IsAny<bool>()))
+                .Callback((ulong tag, bool multiple, bool requeue) => nackTriggered.TrySetResult(true));
+
+            var worker = new TestableGpsRabbitMqConsumerWorker(
+                _serviceProviderMock.Object, _configMock.Object, _appLifetimeMock.Object,
+                _loggerMock.Object, _connectionMock.Object, mockRedis.Object
+            );
+
+            // Pre-seed ProcessedEvents in DbContext to simulate DB duplicate
+            var point = new TrackPoint("rider_dup_repair_fail", 13.95, 100.9, new DateTime(2026, 9, 20, 14, 0, 0, DateTimeKind.Utc));
+            string key = $"{point.RiderId}_{point.Timestamp.Ticks}";
+            byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(key));
+            var existingEventId = new Guid(hash.AsSpan(0, 16));
+
+            _dbContextMock.Object.ProcessedEvents.Add(new ProcessedEvent
+            {
+                EventId = existingEventId,
+                HandlerName = "GpsConsumer",
+                ProcessedAt = DateTime.UtcNow.AddMinutes(-5)
+            });
+            await _dbContextMock.Object.SaveChangesAsync();
+
+            using var cts = new CancellationTokenSource();
+            var runTask = worker.StartAsync(cts.Token);
+
+            int retries = 0;
+            while (capturedConsumer == null && retries < 20)
+            {
+                await Task.Delay(50);
+                retries++;
+            }
+            Assert.NotNull(capturedConsumer);
+
+            var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(point));
+            ulong deliveryTag = 505;
+
+            await capturedConsumer.HandleBasicDeliver(
+                "consumer_tag", deliveryTag, true, "", "gps_telemetry_queue",
+                _channelMock.Object.CreateBasicProperties(), body
+            );
+
+            var nacked = await Task.WhenAny(nackTriggered.Task, Task.Delay(5000)) == nackTriggered.Task;
+            Assert.True(nacked, "BasicNack was not triggered.");
+
+            await cts.CancelAsync();
+            await runTask;
+
+            // Verify: BasicAck is NEVER called, and BasicNack IS called (message not dropped, sent to DLQ)
+            _channelMock.Verify(c => c.BasicAck(It.IsAny<ulong>(), It.IsAny<bool>()), Times.Never);
+            _channelMock.Verify(c => c.BasicNack(deliveryTag, true, false), Times.Once);
+        }
+
         // Subclass to inject Mock Connection and bypass actual socket creation
         private class TestableGpsRabbitMqConsumerWorker : GpsRabbitMqConsumerWorker
         {
@@ -307,7 +715,8 @@ namespace BackendApi.UnitTests.Telemetry
                 IConfiguration configuration,
                 IHostApplicationLifetime appLifetime,
                 ILogger<GpsRabbitMqConsumerWorker> logger,
-                IConnection mockConnection) : base(serviceProvider, configuration, appLifetime, logger)
+                IConnection mockConnection,
+                IConnectionMultiplexer? redis = null) : base(serviceProvider, configuration, appLifetime, logger, redis)
             {
                 _mockConnection = mockConnection;
             }
@@ -319,5 +728,3 @@ namespace BackendApi.UnitTests.Telemetry
         }
     }
 }
-
-

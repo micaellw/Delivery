@@ -203,5 +203,48 @@ public class EventBusTests : IAsyncLifetime
         Assert.Same(TestIntegrationEventHandler.Tcs.Task, normalCompleted);
         Assert.Equal(1, TestIntegrationEventHandler.CallCount);
     }
-}
 
+    [Fact]
+    public async Task EventBus_ExpiredEventOutsideRetention_DroppedWithoutExecutingHandler()
+    {
+        // Arrange - Setup EventBus and Test Handler
+        var testFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.AddTransient<TestIntegrationEventHandler>();
+            });
+        });
+
+        var eventBus = testFactory.Services.GetRequiredService<IEventBus>();
+        TestIntegrationEventHandler.Reset();
+        eventBus.Subscribe<TestIntegrationEvent, TestIntegrationEventHandler>();
+
+        // Act - Publish an integration event created 8 days ago (outside 7-day retention window)
+        var expiredEventId = Guid.NewGuid();
+        var expiredEvent = new TestIntegrationEvent("Expired-Stale-Data")
+        {
+            Id = expiredEventId,
+            CreationDate = DateTime.UtcNow.AddDays(-8)
+        };
+
+        await eventBus.PublishAsync(expiredEvent);
+
+        // Wait up to 3 seconds for consumer to receive and process
+        var completed = await Task.WhenAny(
+            TestIntegrationEventHandler.Tcs.Task,
+            Task.Delay(TimeSpan.FromSeconds(3))
+        );
+
+        // Assert 1: Handler MUST NOT be called (ACK + Skip)
+        Assert.NotSame(TestIntegrationEventHandler.Tcs.Task, completed);
+        Assert.Equal(0, TestIntegrationEventHandler.CallCount);
+
+        // Assert 2: Expired event MUST NOT be written to ProcessedEvents table
+        using var scope = testFactory.Services.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<BackendApi.Data.ApplicationDbContext>();
+        var inDb = await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync(
+            dbContext.ProcessedEvents, pe => pe.EventId == expiredEventId);
+        Assert.False(inDb, "Expired event must NOT be written to ProcessedEvents table");
+    }
+}

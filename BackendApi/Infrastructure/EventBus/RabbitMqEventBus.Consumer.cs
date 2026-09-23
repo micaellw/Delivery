@@ -219,6 +219,25 @@ public partial class RabbitMqEventBus
         }
     }
 
+    /// <summary>
+    /// Retention window in days for Idempotency and Expiration Fence.
+    /// Configurable via IDEMPOTENCY_RETENTION_DAYS or Idempotency:RetentionDays. Default is 7 days.
+    /// </summary>
+    public int RetentionDays
+    {
+        get
+        {
+            var configValue = _configuration["IDEMPOTENCY_RETENTION_DAYS"]
+                ?? _configuration["Idempotency:RetentionDays"];
+
+            if (int.TryParse(configValue, out var days) && days > 0)
+            {
+                return days;
+            }
+            return 7;
+        }
+    }
+
     private async Task ProcessEventAsync(string eventName, string message)
     {
         if (!_handlers.ContainsKey(eventName))
@@ -227,8 +246,9 @@ public partial class RabbitMqEventBus
             return;
         }
 
-        // Parse event ID for idempotency check
+        // Parse event ID and CreationDate for idempotency and expiration check
         Guid eventId;
+        DateTime? creationDate = null;
         try
         {
             using var eventDoc = JsonDocument.Parse(message);
@@ -241,11 +261,28 @@ public partial class RabbitMqEventBus
                 throw new InvalidDataException(
                     $"Event payload for '{eventName}' is missing the required Id property.");
             }
+
+            if (eventDoc.RootElement.TryGetProperty("CreationDate", out var cdProp) && cdProp.TryGetDateTime(out var cd))
+            {
+                creationDate = cd;
+            }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse event ID from payload for event {EventName}", eventName);
             throw;
+        }
+
+        // Expiration Fence (Locked Policy Rules 3, 4, 5, 6):
+        // If CreationDate is older than retention window (> 7 days), drop/skip without executing handlers.
+        // Expired events are ACKed, warning logged, NOT executed, NOT inserted into ProcessedEvents, NOT DLQ'd.
+        var retentionDays = RetentionDays;
+        if (creationDate.HasValue && creationDate.Value < DateTime.UtcNow.AddDays(-retentionDays))
+        {
+            _logger.LogWarning(
+                "Event {EventId} ({EventName}) created at {CreationDate} exceeds retention window of {RetentionDays} days. Dropped as expired (ACK and Skip).",
+                eventId, eventName, creationDate.Value, retentionDays);
+            return;
         }
 
         using var scope = _serviceProvider.CreateScope();

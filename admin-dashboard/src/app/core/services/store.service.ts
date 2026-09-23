@@ -41,7 +41,7 @@ export interface CartItem {
 export class StoreService {
   private http = inject(HttpClient);
   private menuItemService = inject(MenuItemService);
-  private readonly STORAGE_KEY = 'ninemek_delivery_store_menus';
+  private readonly STORAGE_KEY = 'smart_delivery_store_menus';
 
   // In-memory store of menus keyed by shopId
   private menusMap: { [shopId: string]: MenuItem[] } = {};
@@ -384,3 +384,4 @@ export class StoreService {
     return this.http.post<any>(apiUrl, {});
   }
 }
+

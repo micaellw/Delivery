@@ -1,3 +1,4 @@
+import '../core/config/app_constants.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -35,7 +36,7 @@ class _AppState extends ConsumerState<App> {
 
     return MaterialApp.router(
       // ── App Identity ───────────────────────────────────────────────
-      title: 'Delivery',
+      title: AppConstants.appName,
       debugShowCheckedModeBanner: false,
 
       // ── Theme ──────────────────────────────────────────────────────

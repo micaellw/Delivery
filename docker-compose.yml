@@ -88,6 +88,14 @@ services:
       - MessageBroker__Port=5672
       - MessageBroker__Username=${RABBITMQ_USER}
       - MessageBroker__Password=${RABBITMQ_PASSWORD}
+      - Minio__Endpoint=${MINIO_ENDPOINT:-minio:9000}
+      - Minio__AccessKey=${MINIO_ROOT_USER}
+      - Minio__SecretKey=${MINIO_ROOT_PASSWORD}
+      - Minio__BucketName=${MINIO_BUCKET_NAME:-delivery-media}
+      - Minio__TelemetryBucketName=${MINIO_TELEMETRY_BUCKET_NAME:-delivery-telemetry-archive}
+      - Minio__PublicUrl=${MINIO_PUBLIC_URL:-http://localhost:8088/storage/delivery-media}
+      - Minio__UseSsl=${MINIO_USE_SSL:-false}
+      - IDEMPOTENCY_RETENTION_DAYS=${IDEMPOTENCY_RETENTION_DAYS:-7}
     depends_on:
       db:
         condition: service_healthy

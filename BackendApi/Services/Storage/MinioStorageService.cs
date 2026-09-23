@@ -22,34 +22,46 @@ namespace BackendApi.Services.Storage
         {
             _logger = logger;
             _bucketName = config["Minio:BucketName"] ?? "delivery-media";
-            _publicUrl = config["Minio:PublicUrl"] ?? "http://localhost:8081/storage/delivery-media";
+            _publicUrl = config["Minio:PublicUrl"] ?? "http://localhost:8088/storage/delivery-media";
 
-            _minioClient = new MinioClient()
-                .WithEndpoint(config["Minio:Endpoint"] ?? "minio:9000")
-                .WithCredentials(config["Minio:AccessKey"], config["Minio:SecretKey"])
-                .WithSSL(config.GetValue<bool>("Minio:UseSsl"))
-                .Build();
-            
-            InitializeBucketAsync().GetAwaiter().GetResult();
+            var endpoint = config["Minio:Endpoint"] ?? "minio:9000";
+            var accessKey = config["Minio:AccessKey"];
+            var secretKey = config["Minio:SecretKey"];
+            var useSsl = config.GetValue<bool>("Minio:UseSsl");
+
+            var builder = new MinioClient()
+                .WithEndpoint(endpoint)
+                .WithSSL(useSsl);
+
+            var effectiveAccessKey = string.IsNullOrWhiteSpace(accessKey) ? "minioadmin" : accessKey;
+            var effectiveSecretKey = string.IsNullOrWhiteSpace(secretKey) ? "miniopassword123" : secretKey;
+            builder = builder.WithCredentials(effectiveAccessKey, effectiveSecretKey);
+
+            _minioClient = builder.Build();
+            // Constructor is now 100% clean and non-blocking (zero synchronous network I/O)
         }
 
-        private async Task InitializeBucketAsync()
+        public async Task EnsureBucketExistsAsync(CancellationToken ct = default)
         {
             try
             {
-                bool exists = await _minioClient.BucketExistsAsync(new BucketExistsArgs().WithBucket(_bucketName));
+                bool exists = await _minioClient.BucketExistsAsync(new BucketExistsArgs().WithBucket(_bucketName), ct);
                 if (!exists)
                 {
-                    await _minioClient.MakeBucketAsync(new MakeBucketArgs().WithBucket(_bucketName));
+                    await _minioClient.MakeBucketAsync(new MakeBucketArgs().WithBucket(_bucketName), ct);
                     
                     var policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetBucketLocation\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::" + _bucketName + "\"]},{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::" + _bucketName + "/*\"]}]}";
-                    await _minioClient.SetPolicyAsync(new SetPolicyArgs().WithBucket(_bucketName).WithPolicy(policy));
+                    await _minioClient.SetPolicyAsync(new SetPolicyArgs().WithBucket(_bucketName).WithPolicy(policy), ct);
                     _logger.LogInformation("MinIO Bucket {BucketName} created with public-read policy.", _bucketName);
+                }
+                else
+                {
+                    _logger.LogInformation("MinIO Bucket {BucketName} verified existing.", _bucketName);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to initialize MinIO bucket.");
+                _logger.LogError(ex, "Failed to initialize MinIO bucket {BucketName}. Service startup continues; requests may retry or degrade.", _bucketName);
             }
         }
 
